@@ -1,5 +1,6 @@
 import rclpy
 from rclpy.node import Node
+import math
 from std_msgs.msg import Bool, Empty
 from geometry_msgs.msg import Twist
 from dbw_ford_msgs.msg import GearCmd, BrakeCmd, SteeringCmd, ThrottleCmd, MiscCmd
@@ -15,11 +16,11 @@ class Autoware_to_Dbw_can(Node):
 
         # Publishers
         self.pub_twist = self.create_publisher(Twist,'/vehicle/cmd_vel', 10)
-        self.pub_brake = self.create_publisher(BrakeCmd,'/vehicle/brake_cmd', 10)
-        self.pub_throttle = self.create_publisher(ThrottleCmd,'/vehicle/throttle_cmd', 10)
+        #self.pub_brake = self.create_publisher(BrakeCmd,'/vehicle/brake_cmd', 10)
+        #self.pub_throttle = self.create_publisher(ThrottleCmd,'/vehicle/throttle_cmd', 10)
         self.pub_misc = self.create_publisher(MiscCmd,'/vehicle/misc_cmd', 10)
-        self.pub_gear = self.create_publisher(GearCmd,'/vehicle/status/gear_cmd', 10)
-        self.pub_steering = self.create_publisher(SteeringCmd,'/vehicle/steering_cmd', 10)
+        #self.pub_gear = self.create_publisher(GearCmd,'/vehicle/status/gear_cmd', 10)
+        #self.pub_steering = self.create_publisher(SteeringCmd,'/vehicle/steering_cmd', 10)
         self.pub_control_mode = self.create_publisher(Empty,'/vehicle/enable', 10)
 
         # Subscribers
@@ -34,11 +35,11 @@ class Autoware_to_Dbw_can(Node):
         self.twist_msg = Twist()
         self.misc_msg = MiscCmd()
         self.gear_msg = GearCmd()
+        self.wheel_base = 2.8498
 
     def callback_control(self, data):
         self.twist_msg.linear.x = data.longitudinal.speed
-        self.twist_msg.angular.z = data.lateral.steering_tire_rotation_rate
-
+        self.twist_msg.angular.z = (math.tan(data.lateral.steering_tire_angle) * data.longitudinal.speed ) / self.wheel_base
 
         self.pub_twist.publish(self.twist_msg)
 

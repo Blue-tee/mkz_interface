@@ -26,7 +26,7 @@ class Dbw_can_to_Autoware(Node):
         self.subscription_steering = self.create_subscription(SteeringReport_dbw, '/vehicle/steering_report', self.callback_steering, 10)
         self.subscription_control_mode = self.create_subscription(Bool, '/vehicle/dbw_enabled', self.callback_control_mode, 10)
 
-        self.timer = self.create_timer(0.1, self.publish_all_msgs)
+        #self.timer = self.create_timer(0.1, self.publish_all_msgs)
 
     def callback_twist(self, data):
         msg = VelocityReport()
@@ -57,7 +57,7 @@ class Dbw_can_to_Autoware(Node):
     def callback_gear(self, data):
         msg = GearReport()
         msg.stamp = self.get_clock().now().to_msg()
-        conversion_dict = {0:0,1:22,2:20,3:1,4:2:5:23}
+        conversion_dict = {0:0,1:22,2:20,3:1,4:2, 5:23}
         msg.report = conversion_dict[data.state.gear]
 
         self.pub_gear.publish(msg)
@@ -80,6 +80,7 @@ class Dbw_can_to_Autoware(Node):
 def main(args=None):
     rclpy.init(args=args)
     converter_node = Dbw_can_to_Autoware()
+    converter_node.get_logger().info("CAN to Autoware Node starts")
 
     rclpy.spin(converter_node)
 
