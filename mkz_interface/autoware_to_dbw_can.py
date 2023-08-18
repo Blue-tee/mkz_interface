@@ -4,7 +4,7 @@ import math
 from std_msgs.msg import Bool, Empty
 from geometry_msgs.msg import Twist
 from dbw_ford_msgs.msg import GearCmd, BrakeCmd, SteeringCmd, ThrottleCmd, MiscCmd
-
+from dataspeed_ulc_msgs.msg import UlcCmd
 from autoware_auto_vehicle_msgs.msg import TurnIndicatorsCommand, GearCommand, HazardLightsCommand
 from autoware_auto_control_msgs.msg import AckermannControlCommand, 
 from tier4_vehicle_msgs.msg import VehicleEmergencyStamped
@@ -15,13 +15,13 @@ class Autoware_to_Dbw_can(Node):
         super().__init__('autoware_to_dbw_can')
 
         # Publishers
-        self.pub_twist = self.create_publisher(Twist,'/vehicle/cmd_vel', 10)
+        self.pub_ulc = self.create_publisher(UlcCmd,'/vehicle/ulc_cmd', 10)
         #self.pub_brake = self.create_publisher(BrakeCmd,'/vehicle/brake_cmd', 10)
         #self.pub_throttle = self.create_publisher(ThrottleCmd,'/vehicle/throttle_cmd', 10)
-        self.pub_misc = self.create_publisher(MiscCmd,'/vehicle/misc_cmd', 10)
+        #self.pub_misc = self.create_publisher(MiscCmd,'/vehicle/misc_cmd', 10)
         #self.pub_gear = self.create_publisher(GearCmd,'/vehicle/status/gear_cmd', 10)
         #self.pub_steering = self.create_publisher(SteeringCmd,'/vehicle/steering_cmd', 10)
-        self.pub_control_mode = self.create_publisher(Empty,'/vehicle/enable', 10)
+        #self.pub_control_mode = self.create_publisher(Empty,'/vehicle/enable', 10)
 
         # Subscribers
         self.subscription_control = self.create_subscription(AckermannControlCommand, '/control/command/control_cmd', self.callback_control, 10)
@@ -32,16 +32,33 @@ class Autoware_to_Dbw_can(Node):
 
         #self.timer = self.create_timer(0.02, self.publish_all_msgs)
 
-        self.twist_msg = Twist()
         self.misc_msg = MiscCmd()
         self.gear_msg = GearCmd()
         self.wheel_base = 2.8498
 
     def callback_control(self, data):
-        self.twist_msg.linear.x = data.longitudinal.speed
-        self.twist_msg.angular.z = (math.tan(data.lateral.steering_tire_angle) * data.longitudinal.speed ) / self.wheel_base
+        ulc_msg = UlcCmd()
+        ulc_msg.enable_pedals = True
+        ulc_msg.enable_steering = True
+        ulc_msg.enable_shifting = True
+        ulc_msg.shift_from_park = False
 
-        self.pub_twist.publish(self.twist_msg)
+        ulc_msg.pedals_mode = dataspeed_ulc_msgs.msg.UlcCmd.SPEED_MODE
+        ulc_msg.accel_cmd = 0.0
+        ulc_msg.coast_decel = False
+        ulc_msg.steering_mode = dataspeed_ulc_msgs.msg.UlcCmd.YAW_RATE_MODE
+
+        ulc_msg.linear_velocity = data.longitudinal.speed
+        ulc_msg.yaw_command = (math.tan(data.lateral.steering_tire_angle) * data.longitudinal.speed ) / self.wheel_base
+
+        ulc_msg.linear_accel = 0
+        ulc_msg.linear_decel = 0
+        ulc_msg.angular_accel = 0
+        ulc_msg.lateral_accel = 0
+        ulc_msg.jerk_limit_throttle = 0
+        ulc_msg.jerk_limit_brake = 0
+
+        self.pub_ulc.publish(ulc_msg)
 
     def callback_emergency(self, data):
         pass
@@ -72,6 +89,7 @@ class Autoware_to_Dbw_can(Node):
 def main(args=None):
     rclpy.init(args=args)
     converter_node = Autoware_to_Dbw_can()
+    converter_node.get_logger().info("Autoware to CAN Node starts")
 
     rclpy.spin(converter_node)
 

@@ -2,6 +2,8 @@
 
   <node pkg= "mkz_interface" exec="dbw_can_to_autoware" name="dbw_can_to_autoware" >
   </node>
-
+  
+  <!--node pkg= "mkz_interface" exec="autoware_to_dbw_can" name="autoware_to_dbw_can" >
+  </node-->
 
 </launch>
