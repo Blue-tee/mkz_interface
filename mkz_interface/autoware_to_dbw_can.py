@@ -5,8 +5,9 @@ from std_msgs.msg import Bool, Empty
 from geometry_msgs.msg import Twist
 from dbw_ford_msgs.msg import GearCmd, BrakeCmd, SteeringCmd, ThrottleCmd, MiscCmd
 from dataspeed_ulc_msgs.msg import UlcCmd
+import dataspeed_ulc_msgs
 from autoware_auto_vehicle_msgs.msg import TurnIndicatorsCommand, GearCommand, HazardLightsCommand
-from autoware_auto_control_msgs.msg import AckermannControlCommand, 
+from autoware_auto_control_msgs.msg import AckermannControlCommand
 from tier4_vehicle_msgs.msg import VehicleEmergencyStamped
 
 
@@ -26,22 +27,24 @@ class Autoware_to_Dbw_can(Node):
         # Subscribers
         self.subscription_control = self.create_subscription(AckermannControlCommand, '/control/command/control_cmd', self.callback_control, 10)
         self.subscription_emergency = self.create_subscription(VehicleEmergencyStamped, '/control/command/emergency_cmd', self.callback_emergency, 10)
-        self.subscription_gear = self.create_subscription(GearCommand, '/control/command/gear_cmd', self.callback_gear, 10)
+        #self.subscription_gear = self.create_subscription(GearCommand, '/control/command/gear_cmd', self.callback_gear, 10)
         self.subscription_hazard= self.create_subscription(HazardLightsCommand, '/control/command/hazard_lights_cmd', self.callback_hazard, 10)
-        self.subscription_turn_signal = self.create_subscription(TurnIndicatorsCommand, '/control/command/turn_indicators_cmd', self.callback_turn_signal, 10)
+        #self.subscription_turn_signal = self.create_subscription(TurnIndicatorsCommand, '/control/command/turn_indicators_cmd', self.callback_turn_signal, 10)
 
-        #self.timer = self.create_timer(0.02, self.publish_all_msgs)
-
+ 
         self.misc_msg = MiscCmd()
         self.gear_msg = GearCmd()
         self.wheel_base = 2.8498
 
     def callback_control(self, data):
         ulc_msg = UlcCmd()
+        ulc_msg.header.stamp = data.stamp
+        ulc_msg.header.frame_id = "base_link"
+        ulc_msg.clear = True
         ulc_msg.enable_pedals = True
-        ulc_msg.enable_steering = True
+        ulc_msg.enable_steering = False
         ulc_msg.enable_shifting = True
-        ulc_msg.shift_from_park = False
+        ulc_msg.shift_from_park = True
 
         ulc_msg.pedals_mode = dataspeed_ulc_msgs.msg.UlcCmd.SPEED_MODE
         ulc_msg.accel_cmd = 0.0
@@ -51,12 +54,12 @@ class Autoware_to_Dbw_can(Node):
         ulc_msg.linear_velocity = data.longitudinal.speed
         ulc_msg.yaw_command = (math.tan(data.lateral.steering_tire_angle) * data.longitudinal.speed ) / self.wheel_base
 
-        ulc_msg.linear_accel = 0
-        ulc_msg.linear_decel = 0
-        ulc_msg.angular_accel = 0
-        ulc_msg.lateral_accel = 0
-        ulc_msg.jerk_limit_throttle = 0
-        ulc_msg.jerk_limit_brake = 0
+        ulc_msg.linear_accel = 0.0
+        ulc_msg.linear_decel = 0.0
+        ulc_msg.angular_accel = 0.0
+        ulc_msg.lateral_accel = 0.0
+        ulc_msg.jerk_limit_throttle = 0.0
+        ulc_msg.jerk_limit_brake = 0.0
 
         self.pub_ulc.publish(ulc_msg)
 
@@ -65,7 +68,7 @@ class Autoware_to_Dbw_can(Node):
 
     def callback_gear(self, data):
         self.gear_msg.header.stamp = self.get_clock().now().to_msg()
-        conversion_dict = {0:0, 1:3, 2:4, 20:2:, 22:1, 23:5}
+        conversion_dict = {0:0, 1:3, 2:4, 20:2, 22:1, 23:5}
         self.gear_msg.cmd.gear = conversion_dict[data.command]
 
     def callback_hazard(self, data):

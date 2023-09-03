@@ -24,7 +24,7 @@ class Dbw_can_to_Autoware(Node):
         self.subscription_turn_signal = self.create_subscription(Misc1Report, '/vehicle/misc_1_report', self.callback_turn_signal, 10)
         self.subscription_gear = self.create_subscription(GearReport_dbw, '/vehicle/gear_report', self.callback_gear, 10)
         self.subscription_steering = self.create_subscription(SteeringReport_dbw, '/vehicle/steering_report', self.callback_steering, 10)
-        self.subscription_control_mode = self.create_subscription(Bool, '/vehicle/dbw_enabled', self.callback_control_mode, 10)
+        #self.subscription_control_mode = self.create_subscription(Bool, '/vehicle/dbw_enabled', self.callback_control_mode, 10)
 
         #self.timer = self.create_timer(0.1, self.publish_all_msgs)
 
@@ -36,6 +36,12 @@ class Dbw_can_to_Autoware(Node):
         msg.heading_rate = data.twist.angular.z
 
         self.pub_velocity.publish(msg)
+
+        ctrl_msg = ControlModeReport()
+        ctrl_msg.stamp = self.get_clock().now().to_msg()
+        ctrl_msg.mode = 1
+
+        self.pub_control_mode.publish(ctrl_msg)
 
     def callback_turn_signal(self, data):
         turn_msg = TurnIndicatorsReport()
@@ -64,7 +70,7 @@ class Dbw_can_to_Autoware(Node):
 
     def callback_steering(self, data):
         msg = SteeringReport()
-        msg.stamp = self.get_clock().now().to_msg()
+        msg.stamp = data.header.stamp
         msg.steering_tire_angle = data.steering_wheel_angle
 
         self.pub_steering.publish(msg)
@@ -72,7 +78,7 @@ class Dbw_can_to_Autoware(Node):
     def callback_control_mode(self, data):
         msg = ControlModeReport()
         msg.stamp = self.get_clock().now().to_msg()
-        msg.mode = data.data
+        msg.mode = 1
 
         self.pub_control_mode.publish(msg)
 
