@@ -27,11 +27,16 @@ class Dbw_can_to_Autoware(Node):
         #self.subscription_control_mode = self.create_subscription(Bool, '/vehicle/dbw_enabled', self.callback_control_mode, 10)
 
         #self.timer = self.create_timer(0.1, self.publish_all_msgs)
+        self.steering_ratio = 14.8
+
+        self.reverse = False
 
     def callback_twist(self, data):
         msg = VelocityReport()
         msg.header = data.header
         msg.longitudinal_velocity = data.twist.linear.x
+        if self.reverse:
+            msg.longitudinal_velocity = - data.twist.linear.x
         msg.lateral_velocity = data.twist.linear.y
         msg.heading_rate = data.twist.angular.z
 
@@ -62,6 +67,10 @@ class Dbw_can_to_Autoware(Node):
 
     def callback_gear(self, data):
         msg = GearReport()
+        if data.state.gear == 2:
+            self.reverse = True
+        else:
+            self.reverse = False
         msg.stamp = self.get_clock().now().to_msg()
         conversion_dict = {0:0,1:22,2:20,3:1,4:2, 5:23}
         msg.report = conversion_dict[data.state.gear]
@@ -71,7 +80,7 @@ class Dbw_can_to_Autoware(Node):
     def callback_steering(self, data):
         msg = SteeringReport()
         msg.stamp = data.header.stamp
-        msg.steering_tire_angle = data.steering_wheel_angle
+        msg.steering_tire_angle = data.steering_wheel_angle / self.steering_ratio
 
         self.pub_steering.publish(msg)
 
