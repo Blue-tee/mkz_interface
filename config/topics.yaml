@@ -1,0 +1,84 @@
+# mkz_interface/config/topics.yaml — ROS 2 compliant (per-node sections)
+
+autoware_to_dbw_can:
+  ros__parameters:
+    # Rates & safety
+    rate_hz: 50
+    watchdog_ms: 200
+
+    # Engage handling
+    engage_msg_type: engage           # 'engage' or 'bool'
+    engage_topic: /vehicle_cmd_gate/output/engage
+    enable_on_engage: false
+
+    # Control message selection
+    control_msg_type: control         # 'control' or 'ackermann'
+
+    # Conversion (percent-based longitudinal)
+    steering_wheel_to_tire_ratio: -14.8
+    accel_to_percent_gain: 0.5
+    max_throttle: 0.80
+    max_brake: 0.80
+
+    # Interlock (brake-to-shift)
+    gear_change_requires_brake: true
+    gear_change_brake_percent: 0.25
+    gear_change_speed_thresh: 0.1     # m/s
+    gear_change_timeout_ms: 1500
+    wheel_speed_units: mps            # for WheelSpeedReport used by interlock
+
+    # Gear-change diagnostics
+    gear_diag_warn_after_ms: 700
+    gear_diag_log_interval_ms: 500
+    
+    # Throttle/Brake Parameters
+    throttle_cmd_type: 2   # 1=CMD_PEDAL, 2=CMD_PERCENT
+    brake_cmd_type: 2      # 1=CMD_PEDAL, 2=CMD_PERCENT
+
+    # --- Autoware (vehicle_cmd_gate) outputs → subscribe here ---
+    aw_control_cmd: /vehicle_cmd_gate/output/command/control_cmd
+    aw_gear_cmd:    /vehicle_cmd_gate/output/command/gear_cmd
+    aw_turn_cmd:    /vehicle_cmd_gate/output/command/turn_indicators_cmd
+    aw_hazard_cmd:  /vehicle_cmd_gate/output/command/hazard_lights_cmd
+
+    # --- Dataspeed command topics → publish here ---
+    dbw_throttle_cmd: /vehicle/throttle_cmd
+    dbw_brake_cmd:    /vehicle/brake_cmd
+    dbw_steering_cmd: /vehicle/steering_cmd
+    dbw_gear_cmd:     /vehicle/gear_cmd
+    dbw_misc_cmd:     /vehicle/misc_cmd
+    dbw_enable_cmd:   /vehicle/enable
+    dbw_disable_cmd:  /vehicle/disable
+
+    # --- DBW feedback needed by this node ---
+    dbw_dbw_enabled:        /vehicle/dbw_enabled
+    dbw_wheel_speed_report: /vehicle/wheel_speed_report
+    dbw_gear_report:        /vehicle/gear_report
+
+
+dbw_can_to_autoware:
+  ros__parameters:
+    # Conversions
+    steering_wheel_to_tire_ratio: -14.8
+    wheel_speed_units: mps              # 'mps' or 'kph'
+
+    # --- Dataspeed feedback → subscribe here ---
+    dbw_wheel_speed_report: /vehicle/wheel_speed_report
+    dbw_steering_report:    /vehicle/steering_report
+    dbw_gear_report:        /vehicle/gear_report
+    dbw_misc_report:        /vehicle/misc_1_report
+    dbw_dbw_enabled:        /vehicle/dbw_enabled
+    dbw_brake_report:       /vehicle/brake_report
+    dbw_throttle_report:    /vehicle/throttle_report
+
+    # --- Autoware status → publish here ---
+    aw_velocity_status:        /vehicle/status/velocity_status
+    aw_steering_status:        /vehicle/status/steering_status
+    aw_gear_status:            /vehicle/status/gear_status
+    aw_turn_status:            /vehicle/status/turn_indicators_status
+    aw_hazard_status:          /vehicle/status/hazard_lights_status
+    aw_control_mode_status:    /vehicle/status/control_mode
+
+    # Extra steering status for vehicle_cmd_gate (set "" to disable)
+    aw_steering_status_for_gate: /vehicle_cmd_gate/input/steering
+
