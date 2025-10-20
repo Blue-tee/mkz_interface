@@ -6,6 +6,8 @@ cd ~/autoware_mkz_ws
 colcon build --merge-install --symlink-install --packages-select mkz_interface
 # colcon build --symlink-install --packages-select mkz_interface
 
+Keep in mind this package is named mkz_interface, whereas the other package in vehicle is mkz_vehicle_launch
+
 
 To launch mkz_interface.
 Source and launch
@@ -32,4 +34,3 @@ ros2 topic pub --once /vehicle_cmd_gate/output/command/gear_cmd \
 ros2 interface show dbw_ford_msgs/msg/ThrottleCmd
 ros2 interface show dbw_ford_msgs/msg/BrakeCmd
 
-fggfgfgffg
