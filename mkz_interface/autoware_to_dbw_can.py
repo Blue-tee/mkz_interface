@@ -104,10 +104,14 @@ class AutowareToDbw(Node):
 
         # Interlock (brake-to-shift) parameters
         self.declare_parameter('gear_change_requires_brake', True)
-        self.declare_parameter('gear_change_brake_percent', 0.25)      # 25% brake hold during shift
+        self.declare_parameter('gear_change_brake_percent', 0.65)      # 65% brake hold during shift
         self.declare_parameter('gear_change_speed_thresh', 0.2)        # m/s
         self.declare_parameter('gear_change_timeout_ms', 1500)         # ms
         self.declare_parameter('wheel_speed_units', 'mps')             # 'mps' or 'kph'
+
+        # Post-shift brake hold
+        self.declare_parameter('gear_post_shift_hold_ms', 1000)       # 1.0 s post-hold
+        self.declare_parameter('gear_post_shift_brake_percent', -1.0) # -1 → reuse gear_change_brake_percent
 
         # Gear diagnostics
         self.declare_parameter('gear_diag_warn_after_ms', 700)
@@ -149,6 +153,7 @@ class AutowareToDbw(Node):
             'dbw_enable_cmd','dbw_disable_cmd','dbw_dbw_enabled',
             'dbw_wheel_speed_report','dbw_gear_report',
             'throttle_cmd_type','brake_cmd_type',
+            'gear_post_shift_hold_ms','gear_post_shift_brake_percent',
         ])}
 
         self.rate_hz               = float(p['rate_hz'])
@@ -188,6 +193,12 @@ class AutowareToDbw(Node):
         self.dbw_dbw_enabled     = str(p['dbw_dbw_enabled'])
         self.dbw_wheel_speed_report = str(p['dbw_wheel_speed_report'])
         self.dbw_gear_report        = str(p['dbw_gear_report'])
+
+        # Brake hold
+        self.post_hold_ms = int(p['gear_post_shift_hold_ms'])
+        _gpsbp = float(p['gear_post_shift_brake_percent'])
+        self.post_hold_brake_pct = _gpsbp if _gpsbp >= 0.0 else self.interlock_brake_pct
+
 
         # NEW: assign pedal types
         self.throttle_cmd_type = int(p['throttle_cmd_type'])
@@ -258,6 +269,7 @@ class AutowareToDbw(Node):
         self.pending_gear_dbw: Optional[int] = None
         self.interlock_deadline: Optional[float] = None
         self.interlock_active: bool = False
+        self.post_hold_deadline: Optional[float] = None
 
         # Shutdown coordination
         self._shutdown_requested = False
@@ -315,6 +327,8 @@ class AutowareToDbw(Node):
             self.pending_gear_dbw = None
             self.interlock_active = False
             self.interlock_deadline = None
+            self.post_hold_deadline = time.time() + self.post_hold_ms / 1000.0
+            return
 
     # ================= Control callbacks =================
     def on_control_control(self, cmd: AwControl):
@@ -442,6 +456,13 @@ class AutowareToDbw(Node):
                         self.pending_gear_dbw = None
                         self.interlock_active = False
                         self.interlock_deadline = None
+                # Post-shift hold window (zero throttle + hold brake for extra time)
+                if self.post_hold_deadline:
+                    if now <= self.post_hold_deadline:
+                        throttle_pct = 0.0
+                        brake_pct = max(brake_pct, self.post_hold_brake_pct)
+                    else:
+                        self.post_hold_deadline = None
 
                 # Lateral: tire angle(rad) → steering wheel angle(rad)
                 swa_cmd = clamp(self.last_tire_angle * self.st_ratio, -8.0, 8.0)

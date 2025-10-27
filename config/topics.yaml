@@ -22,7 +22,8 @@ autoware_to_dbw_can:
 
     # Interlock (brake-to-shift)
     gear_change_requires_brake: true
-    gear_change_brake_percent: 0.25
+    gear_change_brake_percent: 0.65
+    gear_post_shift_hold_ms: 1000     # hold brake 1 second after shift
     gear_change_speed_thresh: 0.1     # m/s
     gear_change_timeout_ms: 1500
     wheel_speed_units: mps            # for WheelSpeedReport used by interlock
