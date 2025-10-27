@@ -27,6 +27,7 @@ autoware_to_dbw_can:
     gear_change_speed_thresh: 0.1     # m/s
     gear_change_timeout_ms: 1500
     wheel_speed_units: mps            # for WheelSpeedReport used by interlock
+    gear_post_shift_brake_percent: 0.70
 
     # Gear-change diagnostics
     gear_diag_warn_after_ms: 700
