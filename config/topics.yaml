@@ -42,6 +42,9 @@ autoware_to_dbw_can:
     aw_gear_cmd:    /vehicle_cmd_gate/output/command/gear_cmd
     aw_turn_cmd:    /vehicle_cmd_gate/output/command/turn_indicators_cmd
     aw_hazard_cmd:  /vehicle_cmd_gate/output/command/hazard_lights_cmd
+    # --- SIM-ONLY hazard status (no real DBW actuation) ---
+    sim_publish_hazard_status: true          # set false on the real car
+    hazard_lights_status_topic: /vehicle/status/hazard_lights_status
 
     # --- Dataspeed command topics → publish here ---
     dbw_throttle_cmd: /vehicle/throttle_cmd

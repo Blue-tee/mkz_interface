@@ -23,6 +23,7 @@ from autoware_vehicle_msgs.msg import (
     GearCommand as AwGearCommand,
     TurnIndicatorsCommand as AwTurnCmd,
     HazardLightsCommand as AwHazCmd,
+    HazardLightsReport,                    # [+] SIM-ONLY status publisher
     Engage as AwEngage,
 )
 
@@ -141,6 +142,10 @@ class AutowareToDbw(Node):
         self.declare_parameter('throttle_cmd_type', 1)  # 1 = CMD_PEDAL, 2 = CMD_PERCENT
         self.declare_parameter('brake_cmd_type', 1)     # 1 = CMD_PEDAL, 2 = CMD_PERCENT
 
+        # ---- Hazards (unsupported on Dataspeed DBW; sim-only status is optional)
+        self.declare_parameter('sim_publish_hazard_status', False)
+        self.declare_parameter('hazard_lights_status_topic', '/vehicle/status/hazard_lights_status')
+
         # Pull params
         p = {pp.name: pp.value for pp in self.get_parameters([
             'rate_hz','watchdog_ms','enable_on_engage',
@@ -153,6 +158,7 @@ class AutowareToDbw(Node):
             'dbw_enable_cmd','dbw_disable_cmd','dbw_dbw_enabled',
             'dbw_wheel_speed_report','dbw_gear_report',
             'throttle_cmd_type','brake_cmd_type',
+            'sim_publish_hazard_status','hazard_lights_status_topic',
             'gear_post_shift_hold_ms','gear_post_shift_brake_percent',
         ])}
 
@@ -204,6 +210,11 @@ class AutowareToDbw(Node):
         self.throttle_cmd_type = int(p['throttle_cmd_type'])
         self.brake_cmd_type    = int(p['brake_cmd_type'])
 
+        # Hazards (sim-only status option)
+        self._sim_publish_hazard_status = bool(p['sim_publish_hazard_status'])
+        self._hazard_status_topic = str(p['hazard_lights_status_topic'])
+        self._hazard_warned_once = False
+
         # -------- Publishers (DBW) --------
         self.pub_throttle = self.create_publisher(ThrottleCmd, self.dbw_throttle_cmd, qos)
         self.pub_brake    = self.create_publisher(BrakeCmd,    self.dbw_brake_cmd,    qos)
@@ -212,6 +223,8 @@ class AutowareToDbw(Node):
         self.pub_misc     = self.create_publisher(MiscCmd,     self.dbw_misc_cmd,     qos)
         self.pub_enable   = self.create_publisher(Bool,        self.dbw_enable_cmd,   qos)
         self.pub_disable  = self.create_publisher(Bool,        self.dbw_disable_cmd,  qos)
+        # Publisher for SIM-ONLY hazard status (no DBW actuation)
+        self._pub_hazard_status = self.create_publisher(HazardLightsReport, self._hazard_status_topic, 10)
 
         # -------- Subscriptions --------
         # Engage
@@ -396,10 +409,35 @@ class AutowareToDbw(Node):
         self.pub_gear.publish(m)
 
     def on_hazard(self, cmd: AwHazCmd):
-        self._aw_hazard_cmd = int(getattr(cmd, "command", 0))
-        if self._aw_hazard_cmd == 2:
-            self._aw_turn_cmd = 1  # DISABLE
+        """
+        Dataspeed DBW (MKZ) cannot actuate hazards. Ignore the command with a one-time WARN.
+        Optionally, for SIM ONLY, publish HazardLightsReport so RViz/Planning Sim can visualize it.
+        """
+        if not self._hazard_warned_once:
+            self.get_logger().warn(
+                "Hazard lights are not controllable via Dataspeed DBW on the MKZ. "
+                "Ignoring HazardLightsCommand (this warning prints once)."
+            )
+            self._hazard_warned_once = True
+
+        # Ensure hazards do NOT affect MiscCmd/turn policy on the real vehicle
+        self._aw_hazard_cmd = 1  # force DISABLE in our internal policy
+        # (keep existing _aw_turn_cmd as-is; user did not request turn mapping changes)
         self._recalc_misc_policy()
+
+        # SIM-ONLY: echo as status for visualization
+        if not self._sim_publish_hazard_status:
+            return
+        rep = HazardLightsReport()
+        rep.stamp = self.get_clock().now().to_msg()
+        cmd_val = int(getattr(cmd, "command", 0))
+        if cmd_val == AwHazCmd.ENABLE:
+            rep.report = HazardLightsReport.ENABLE
+        elif cmd_val == AwHazCmd.DISABLE:
+            rep.report = HazardLightsReport.DISABLE
+        else:
+            return  # NO_COMMAND
+        self._pub_hazard_status.publish(rep)
 
     def on_turn(self, cmd: AwTurnCmd):
         self._aw_hazard_cmd = 1
