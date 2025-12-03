@@ -24,6 +24,7 @@ from dbw_ford_msgs.msg import (
     ThrottleReport,
 )
 
+
 def _extract_dbw_gear_value(state_obj):
     """Return DBW enum 0..5 from nested Gear or plain uint8."""
     for attr in ('gear',):
@@ -33,6 +34,7 @@ def _extract_dbw_gear_value(state_obj):
             except Exception:
                 pass
     return int(state_obj)
+
 
 def _dbw_to_aw_gear(dbw_val: int) -> int:
     """
@@ -48,7 +50,8 @@ def _dbw_to_aw_gear(dbw_val: int) -> int:
         5: 23,  # LOW
     }.get(int(dbw_val), 0)
 
-def _coerce_uint8(obj, candidates=('value','data','cmd')):
+
+def _coerce_uint8(obj, candidates=('value', 'data', 'cmd')):
     """Return an int from an object that might be nested or already numeric."""
     for a in candidates:
         if hasattr(obj, a):
@@ -60,6 +63,7 @@ def _coerce_uint8(obj, candidates=('value','data','cmd')):
         return int(obj)
     except Exception:
         return 0
+
 
 class DbwToAutoware(Node):
     def __init__(self):
@@ -90,11 +94,11 @@ class DbwToAutoware(Node):
         self.declare_parameter('wheel_speed_units', 'mps')  # 'mps' or 'kph'
 
         p = {pp.name: pp.value for pp in self.get_parameters([
-            'dbw_wheel_speed_report','dbw_steering_report','dbw_gear_report','dbw_misc_report',
-            'dbw_dbw_enabled','dbw_brake_report','dbw_throttle_report',
-            'aw_velocity_status','aw_steering_status','aw_gear_status','aw_turn_status',
-            'aw_hazard_status','aw_control_mode_status','aw_steering_status_for_gate',
-            'steering_wheel_to_tire_ratio','wheel_speed_units'
+            'dbw_wheel_speed_report', 'dbw_steering_report', 'dbw_gear_report', 'dbw_misc_report',
+            'dbw_dbw_enabled', 'dbw_brake_report', 'dbw_throttle_report',
+            'aw_velocity_status', 'aw_steering_status', 'aw_gear_status', 'aw_turn_status',
+            'aw_hazard_status', 'aw_control_mode_status', 'aw_steering_status_for_gate',
+            'steering_wheel_to_tire_ratio', 'wheel_speed_units'
         ])}
 
         # Publishers
@@ -131,9 +135,9 @@ class DbwToAutoware(Node):
     def _extract_wheel_speeds(self, msg: WheelSpeedReport):
         # Try common layouts once and cache the result
         candidates = [
-            ('fl','fr','rl','rr'),
-            ('front_left','front_right','rear_left','rear_right'),
-            ('wheel_speed_fl','wheel_speed_fr','wheel_speed_rl','wheel_speed_rr'),
+            ('fl', 'fr', 'rl', 'rr'),
+            ('front_left', 'front_right', 'rear_left', 'rear_right'),
+            ('wheel_speed_fl', 'wheel_speed_fr', 'wheel_speed_rl', 'wheel_speed_rr'),
         ]
         if self._ws_fields is None:
             for names in candidates:
@@ -143,7 +147,7 @@ class DbwToAutoware(Node):
                     break
             # Fallback: some drivers expose a single vehicle speed
             if self._ws_fields is None:
-                single_candidates = ['speed','vehicle_speed','vehicle_velocity','longitudinal_velocity']
+                single_candidates = ['speed', 'vehicle_speed', 'vehicle_velocity', 'longitudinal_velocity']
                 for n in single_candidates:
                     if hasattr(msg, n):
                         v = float(getattr(msg, n))
@@ -170,6 +174,7 @@ class DbwToAutoware(Node):
             return
         vr = VelocityReport()
         vr.header.stamp = self.get_clock().now().to_msg()
+        vr.header.frame_id = "base_link"  # <<< added so Autoware's velocity converter sees base_link
         vr.longitudinal_velocity = v
         vr.lateral_velocity = 0.0
         vr.heading_rate = 0.0
@@ -229,6 +234,7 @@ class DbwToAutoware(Node):
 
     def on_throttle_report(self, msg: ThrottleReport):
         pass  # optional diagnostics
+
 
 def main():
     rclpy.init()

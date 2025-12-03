@@ -9,7 +9,7 @@ autoware_to_dbw_can:
     # Engage handling
     engage_msg_type: engage           # 'engage' or 'bool'
     engage_topic: /vehicle_cmd_gate/output/engage
-    enable_on_engage: false
+    enable_on_engage: true
 
     # Control message selection
     control_msg_type: control         # 'control' or 'ackermann'
