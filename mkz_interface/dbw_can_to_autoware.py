@@ -1,10 +1,20 @@
-# DBW → Autoware status bridge (robust wheel speed & misc extraction)
-# Publishes /vehicle/status/* using autoware_vehicle_msgs
+#!/usr/bin/env python3
+"""
+dbw_can_to_autoware.py
+Bridge: Dataspeed DBW1 reports -> Autoware vehicle status topics.
+
+- Vehicle speed comes from dbw_ford_msgs/SteeringReport.speed (m/s)
+- Steering status is steering_tire_angle = steering_wheel_angle / ratio
+- Hazard status is a SHIM: mirrors the latched hazard command (from hazard_shim_topic)
+"""
+
+from __future__ import annotations
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy
-from std_msgs.msg import Bool
+from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
+
+from std_msgs.msg import Bool, UInt8
 
 from autoware_vehicle_msgs.msg import (
     VelocityReport,
@@ -15,242 +25,150 @@ from autoware_vehicle_msgs.msg import (
     ControlModeReport,
 )
 
-from dbw_ford_msgs.msg import (
-    WheelSpeedReport,
-    SteeringReport,
-    GearReport,
-    Misc1Report,
-    BrakeReport,
-    ThrottleReport,
-)
+from dbw_ford_msgs.msg import SteeringReport, GearReport, Misc1Report
 
 
-def _extract_dbw_gear_value(state_obj):
-    """Return DBW enum 0..5 from nested Gear or plain uint8."""
-    for attr in ('gear',):
-        if hasattr(state_obj, attr):
-            try:
-                return int(getattr(state_obj, attr))
-            except Exception:
-                pass
-    return int(state_obj)
+def _const(msg_cls, name: str, default: int) -> int:
+    return int(getattr(msg_cls, name, default))
 
 
-def _dbw_to_aw_gear(dbw_val: int) -> int:
-    """
-    Map DBW gear (NONE=0,PARK=1,REVERSE=2,NEUTRAL=3,DRIVE=4,LOW=5)
-    → Autoware gear enum:
-      NONE=0, NEUTRAL=1, DRIVE=2..19, REVERSE=20..21, PARK=22, LOW=23..24
-    """
-    return {
-        1: 22,  # PARK
-        2: 20,  # REVERSE
-        3: 1,   # NEUTRAL
-        4: 2,   # DRIVE
-        5: 23,  # LOW
-    }.get(int(dbw_val), 0)
+def _dbw_gear_to_aw(dbw_gear: int) -> int:
+    return {1: 22, 2: 20, 3: 1, 4: 2, 5: 23}.get(int(dbw_gear), 0)
 
 
-def _coerce_uint8(obj, candidates=('value', 'data', 'cmd')):
-    """Return an int from an object that might be nested or already numeric."""
-    for a in candidates:
-        if hasattr(obj, a):
-            try:
-                return int(getattr(obj, a))
-            except Exception:
-                pass
-    try:
-        return int(obj)
-    except Exception:
-        return 0
-
-
-class DbwToAutoware(Node):
-    def __init__(self):
-        super().__init__('dbw_can_to_autoware')
+class DbwCanToAutoware(Node):
+    def __init__(self) -> None:
+        super().__init__("dbw_can_to_autoware")
 
         qos = QoSProfile(depth=10)
         qos.history = QoSHistoryPolicy.KEEP_LAST
         qos.reliability = QoSReliabilityPolicy.RELIABLE
 
-        # Parameters (topics + conversions)
-        self.declare_parameter('dbw_wheel_speed_report', '/vehicle/wheel_speed_report')
-        self.declare_parameter('dbw_steering_report',    '/vehicle/steering_report')
-        self.declare_parameter('dbw_gear_report',        '/vehicle/gear_report')
-        self.declare_parameter('dbw_misc_report',        '/vehicle/misc_1_report')
-        self.declare_parameter('dbw_dbw_enabled',        '/vehicle/dbw_enabled')
-        self.declare_parameter('dbw_brake_report',       '/vehicle/brake_report')
-        self.declare_parameter('dbw_throttle_report',    '/vehicle/throttle_report')
+        qos_tl = QoSProfile(depth=1)
+        qos_tl.history = QoSHistoryPolicy.KEEP_LAST
+        qos_tl.reliability = QoSReliabilityPolicy.RELIABLE
+        qos_tl.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
 
-        self.declare_parameter('aw_velocity_status',     '/vehicle/status/velocity_status')
-        self.declare_parameter('aw_steering_status',     '/vehicle/status/steering_status')
-        self.declare_parameter('aw_gear_status',         '/vehicle/status/gear_status')
-        self.declare_parameter('aw_turn_status',         '/vehicle/status/turn_indicators_status')
-        self.declare_parameter('aw_hazard_status',       '/vehicle/status/hazard_lights_status')
-        self.declare_parameter('aw_control_mode_status', '/vehicle/status/control_mode')
-        self.declare_parameter('aw_steering_status_for_gate', '/vehicle_cmd_gate/input/steering')
+        self.declare_parameter("steering_wheel_to_tire_ratio", 14.8)
 
-        self.declare_parameter('steering_wheel_to_tire_ratio', -14.8)
-        self.declare_parameter('wheel_speed_units', 'mps')  # 'mps' or 'kph'
+        # DBW topics
+        self.declare_parameter("dbw_dbw_enabled", "/vehicle/dbw_enabled")
+        self.declare_parameter("dbw_steering_report", "/vehicle/steering_report")
+        self.declare_parameter("dbw_gear_report", "/vehicle/gear_report")
+        self.declare_parameter("dbw_misc_report", "/vehicle/misc_1_report")
 
-        p = {pp.name: pp.value for pp in self.get_parameters([
-            'dbw_wheel_speed_report', 'dbw_steering_report', 'dbw_gear_report', 'dbw_misc_report',
-            'dbw_dbw_enabled', 'dbw_brake_report', 'dbw_throttle_report',
-            'aw_velocity_status', 'aw_steering_status', 'aw_gear_status', 'aw_turn_status',
-            'aw_hazard_status', 'aw_control_mode_status', 'aw_steering_status_for_gate',
-            'steering_wheel_to_tire_ratio', 'wheel_speed_units'
-        ])}
+        # Hazard shim input
+        self.declare_parameter("hazard_shim_topic", "/mkz_interface/hazard_cmd_latched")
 
-        # Publishers
-        self.pub_vel   = self.create_publisher(VelocityReport,       p['aw_velocity_status'], qos)
-        self.pub_steer = self.create_publisher(AwSteeringReport,     p['aw_steering_status'], qos)
-        self.pub_gear  = self.create_publisher(AwGearReport,         p['aw_gear_status'], qos)
-        self.pub_turn  = self.create_publisher(TurnIndicatorsReport, p['aw_turn_status'], qos)
-        self.pub_haz   = self.create_publisher(HazardLightsReport,   p['aw_hazard_status'], qos)
-        self.pub_mode  = self.create_publisher(ControlModeReport,    p['aw_control_mode_status'], qos)
+        # Autoware status topics
+        self.declare_parameter("aw_velocity_status", "/vehicle/status/velocity_status")
+        self.declare_parameter("aw_steering_status", "/vehicle/status/steering_status")
+        self.declare_parameter("aw_gear_status", "/vehicle/status/gear_status")
+        self.declare_parameter("aw_turn_status", "/vehicle/status/turn_indicators_status")
+        self.declare_parameter("aw_hazard_status", "/vehicle/status/hazard_lights_status")
+        self.declare_parameter("aw_control_mode_status", "/vehicle/status/control_mode")
+        self.declare_parameter("aw_steering_status_for_gate", "/vehicle_cmd_gate/input/steering")
 
-        self.pub_steer_gate = None
-        if isinstance(p['aw_steering_status_for_gate'], str) and p['aw_steering_status_for_gate']:
-            self.pub_steer_gate = self.create_publisher(AwSteeringReport, p['aw_steering_status_for_gate'], qos)
+        self.ratio = float(self.get_parameter("steering_wheel_to_tire_ratio").value)
 
-        # Subscriptions
-        self.sub_ws  = self.create_subscription(WheelSpeedReport, p['dbw_wheel_speed_report'], self.on_wheel_speeds, qos)
-        self.sub_sr  = self.create_subscription(SteeringReport,   p['dbw_steering_report'],    self.on_steer_report, qos)
-        self.sub_gr  = self.create_subscription(GearReport,       p['dbw_gear_report'],        self.on_gear_report, qos)
-        self.sub_m1  = self.create_subscription(Misc1Report,      p['dbw_misc_report'],        self.on_misc_report, qos)
-        self.sub_en  = self.create_subscription(Bool,             p['dbw_dbw_enabled'],        self.on_dbw_enabled, qos)
-        self.sub_br  = self.create_subscription(BrakeReport,      p['dbw_brake_report'],       self.on_brake_report, qos)
-        self.sub_th  = self.create_subscription(ThrottleReport,   p['dbw_throttle_report'],    self.on_throttle_report, qos)
+        # pubs
+        self.pub_vel = self.create_publisher(VelocityReport, self.get_parameter("aw_velocity_status").value, qos)
+        self.pub_steer = self.create_publisher(AwSteeringReport, self.get_parameter("aw_steering_status").value, qos)
+        self.pub_gate_steer = self.create_publisher(AwSteeringReport, self.get_parameter("aw_steering_status_for_gate").value, qos)
+        self.pub_gear = self.create_publisher(AwGearReport, self.get_parameter("aw_gear_status").value, qos)
+        self.pub_turn = self.create_publisher(TurnIndicatorsReport, self.get_parameter("aw_turn_status").value, qos)
+        self.pub_haz = self.create_publisher(HazardLightsReport, self.get_parameter("aw_hazard_status").value, qos)
+        self.pub_mode = self.create_publisher(ControlModeReport, self.get_parameter("aw_control_mode_status").value, qos)
 
-        self.dbw_enabled = False
-        self.ratio = float(p['steering_wheel_to_tire_ratio'])
-        self.ws_units = str(p['wheel_speed_units']).lower()
+        # subs
+        self.create_subscription(Bool, self.get_parameter("dbw_dbw_enabled").value, self._on_enabled, qos_tl)
+        self.create_subscription(SteeringReport, self.get_parameter("dbw_steering_report").value, self._on_steer, qos)
+        self.create_subscription(GearReport, self.get_parameter("dbw_gear_report").value, self._on_gear, qos)
+        self.create_subscription(Misc1Report, self.get_parameter("dbw_misc_report").value, self._on_misc, qos)
+        self.create_subscription(UInt8, self.get_parameter("hazard_shim_topic").value, self._on_hazard_shim, qos)
 
-        # Resolve wheel-speed field names at runtime (supports multiple layouts)
-        self._ws_fields = None  # set to a 4-tuple of attribute names when first msg arrives
+        self.hazard_latched = 0
 
-        self.get_logger().info('DBW→Autoware status bridge started')
+        self.get_logger().info("MKZ DBW1 state bridge ready (publishing Autoware vehicle status topics).")
 
-    # ---- helpers ----
-    def _extract_wheel_speeds(self, msg: WheelSpeedReport):
-        # Try common layouts once and cache the result
-        candidates = [
-            ('fl', 'fr', 'rl', 'rr'),
-            ('front_left', 'front_right', 'rear_left', 'rear_right'),
-            ('wheel_speed_fl', 'wheel_speed_fr', 'wheel_speed_rl', 'wheel_speed_rr'),
-        ]
-        if self._ws_fields is None:
-            for names in candidates:
-                if all(hasattr(msg, n) for n in names):
-                    self._ws_fields = names
-                    self.get_logger().info(f'WheelSpeedReport fields: {names}')
-                    break
-            # Fallback: some drivers expose a single vehicle speed
-            if self._ws_fields is None:
-                single_candidates = ['speed', 'vehicle_speed', 'vehicle_velocity', 'longitudinal_velocity']
-                for n in single_candidates:
-                    if hasattr(msg, n):
-                        v = float(getattr(msg, n))
-                        return [v, v, v, v]
-                raise AttributeError('Unknown WheelSpeedReport field layout')
-        return [float(getattr(msg, n)) for n in self._ws_fields]
+    def _on_hazard_shim(self, msg: UInt8) -> None:
+        self.hazard_latched = int(msg.data)
 
-    # ---- callbacks ----
-    def on_dbw_enabled(self, msg: Bool):
-        self.dbw_enabled = bool(msg.data)
+    def _on_enabled(self, msg: Bool) -> None:
         cm = ControlModeReport()
         cm.stamp = self.get_clock().now().to_msg()
-        cm.mode = ControlModeReport.AUTONOMOUS if self.dbw_enabled else ControlModeReport.MANUAL
+        cm.mode = _const(ControlModeReport, "AUTONOMOUS", 1) if bool(msg.data) else _const(ControlModeReport, "MANUAL", 0)
         self.pub_mode.publish(cm)
 
-    def on_wheel_speeds(self, msg: WheelSpeedReport):
-        try:
-            fl, fr, rl, rr = self._extract_wheel_speeds(msg)
-            v = (fl + fr + rl + rr) / 4.0
-            if self.ws_units == 'kph':
-                v = v / 3.6
-        except Exception as e:
-            self.get_logger().warn(f'WheelSpeedReport parse failed: {e}')
-            return
+    def _on_steer(self, msg: SteeringReport) -> None:
+        tire = float(msg.steering_wheel_angle) / max(1e-6, self.ratio)
+
+        sr = AwSteeringReport()
+        sr.stamp = self.get_clock().now().to_msg()
+        sr.steering_tire_angle = float(tire)
+        self.pub_steer.publish(sr)
+        self.pub_gate_steer.publish(sr)
+
         vr = VelocityReport()
         vr.header.stamp = self.get_clock().now().to_msg()
-        vr.header.frame_id = "base_link"  # <<< added so Autoware's velocity converter sees base_link
-        vr.longitudinal_velocity = v
+        vr.header.frame_id = "base_link"
+        vr.longitudinal_velocity = float(msg.speed)
         vr.lateral_velocity = 0.0
         vr.heading_rate = 0.0
         self.pub_vel.publish(vr)
 
-    def on_steer_report(self, msg: SteeringReport):
-        sr = AwSteeringReport()
-        sr.stamp = self.get_clock().now().to_msg()
-        # Dataspeed provides steering wheel angle (rad) → convert to tire angle
-        try:
-            swa = float(msg.steering_wheel_angle)
-        except Exception:
-            swa = 0.0
-        sr.steering_tire_angle = swa / max(1e-6, self.ratio)
-        self.pub_steer.publish(sr)
-        if self.pub_steer_gate is not None:
-            self.pub_steer_gate.publish(sr)
-
-    def on_gear_report(self, msg: GearReport):
-        try:
-            dbw_val = _extract_dbw_gear_value(msg.state)
-        except Exception as e:
-            self.get_logger().warn(f'GearReport parse failed: {e}')
-            return
-        aw_val = int(_dbw_to_aw_gear(dbw_val))
-        gr = AwGearReport()
-        gr.stamp = self.get_clock().now().to_msg()
-        gr.report = aw_val  # MUST be int
-        self.pub_gear.publish(gr)
-
-    def on_misc_report(self, msg: Misc1Report):
-        # Turn indicators
-        ts = 0
-        if hasattr(msg, 'turn_signal'):
-            ts = _coerce_uint8(getattr(msg, 'turn_signal'))
-        tr = TurnIndicatorsReport()
-        tr.stamp = self.get_clock().now().to_msg()
-        # DBW TurnSignal: NONE=0, LEFT=1, RIGHT=2, HAZARD=3
-        if ts == 1:
-            tr.report = TurnIndicatorsReport.LEFT
-        elif ts == 2:
-            tr.report = TurnIndicatorsReport.RIGHT
-        else:
-            tr.report = TurnIndicatorsReport.DISABLE
-        self.pub_turn.publish(tr)
-
-        # Hazards (either explicit bool or encoded as ts==3)
-        hazard_attr_names = ('hazard_lights', 'hazards', 'hazard', 'hazard_enable')
-        hazard_flag = any(bool(getattr(msg, n, False)) for n in hazard_attr_names) or (ts == 3)
         hz = HazardLightsReport()
         hz.stamp = self.get_clock().now().to_msg()
-        hz.report = HazardLightsReport.ENABLE if hazard_flag else HazardLightsReport.DISABLE
+        hz.report = _const(HazardLightsReport, "ENABLE", 1) if self.hazard_latched != 0 else _const(HazardLightsReport, "DISABLE", 0)
         self.pub_haz.publish(hz)
 
-    def on_brake_report(self, msg: BrakeReport):
-        pass  # optional diagnostics
+    def _on_gear(self, msg: GearReport) -> None:
+        dbw = 0
+        try:
+            dbw = int(msg.state.gear)
+        except Exception:
+            try:
+                dbw = int(msg.state)
+            except Exception:
+                dbw = 0
 
-    def on_throttle_report(self, msg: ThrottleReport):
-        pass  # optional diagnostics
+        gr = AwGearReport()
+        gr.stamp = self.get_clock().now().to_msg()
+        gr.report = int(_dbw_gear_to_aw(dbw))
+        self.pub_gear.publish(gr)
+
+    def _on_misc(self, msg: Misc1Report) -> None:
+        ts = 0
+        if hasattr(msg, "turn_signal"):
+            try:
+                ts = int(msg.turn_signal.value) if hasattr(msg.turn_signal, "value") else int(msg.turn_signal)
+            except Exception:
+                ts = 0
+
+        tr = TurnIndicatorsReport()
+        tr.stamp = self.get_clock().now().to_msg()
+
+        if ts == 1:
+            tr.report = _const(TurnIndicatorsReport, "ENABLE_LEFT", 1)
+        elif ts == 2:
+            tr.report = _const(TurnIndicatorsReport, "ENABLE_RIGHT", 2)
+        else:
+            tr.report = _const(TurnIndicatorsReport, "DISABLE", 0)
+
+        self.pub_turn.publish(tr)
 
 
-def main():
+def main() -> None:
     rclpy.init()
-    node = DbwToAutoware()
+    node = DbwCanToAutoware()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info('Ctrl-C')
+        pass
     finally:
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
-        try:
-            if rclpy.ok():
-                rclpy.shutdown()
-        except Exception:
-            pass
+        node.destroy_node()
+        rclpy.shutdown()
 
+
+if __name__ == "__main__":
+    main()

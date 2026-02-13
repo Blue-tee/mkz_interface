@@ -20,6 +20,8 @@ ros2 launch mkz_interface interface.launch.py
 # Engage (if you gate on engage)
 ros2 topic pub --once /vehicle_cmd_gate/output/engage autoware_vehicle_msgs/msg/Engage "{engage: true}"
 
+ros2 service call /api/autoware/set/engage tier4_external_api_msgs/srv/Engage "{engage: true}"
+
 # To turn steering wheel,brake,accel (test)
 ros2 topic pub --rate 20 /vehicle_cmd_gate/output/command/control_cmd   autoware_control_msgs/msg/Control   "{lateral: {steering_tire_angle: 0.00}, longitudinal: {acceleration: 0.00}}"
 
@@ -38,4 +40,8 @@ ros2 interface show dbw_ford_msgs/msg/BrakeCmd
 ros2 launch dbw_ford_can dbw.launch.xml
 ros2 topic pub /vehicle/enable std_msgs/Empty "{}"
 ros2 topic echo /vehicle/dbw_enabled
+
+
+ ros2 topic pub --once /vehicle_cmd_gate/output/engage autoware_vehicle_msgs/msg/Engage "{engage: true}"
+
 

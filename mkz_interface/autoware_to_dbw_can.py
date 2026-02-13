@@ -1,640 +1,698 @@
 #!/usr/bin/env python3
-# Autoware → Dataspeed DBW1 bridge (percent/pedal-based throttle/brake)
-#
-# Minimal changes from your version:
-#  - New params: throttle_cmd_type, brake_cmd_type (defaults 1 = CMD_PEDAL)
-#  - Use those params in ThrottleCmd/BrakeCmd builders
-#
-# Everything else left as-is (topics, gating, timers, etc.)
+"""
+autoware_to_dbw_can.py
+Bridge: Autoware vehicle_cmd_gate outputs -> Dataspeed DBW1 commands (Lincoln MKZ 2018, DBW1)
+
+Key behaviors:
+- /vehicle/enable and /vehicle/disable are std_msgs/Empty
+- Throttle/Brake published as CMD_PERCENT
+- Steering: Autoware steering_tire_angle (rad) -> DBW steering_wheel_angle_cmd (rad) via ratio
+- Hazards accepted but NOT actuated (publish a shim latch only)
+- Turn signals: burst-mode (avoid continuous spamming)
+
+Gear change interlock (optional):
+- Apply fixed brake %, wait for near-zero speed, send gear cmd, hold brake post-shift.
+- Uses /vehicle/steering_report speed (m/s) and /vehicle/gear_report for confirmation.
+
+NEW (Intelligent steering velocity, safe):
+- Uses DBW SteeringReport.steering_wheel_angle (rad) + speed (m/s).
+- Computes steering_wheel_angle_velocity as a function of:
+    (a) wheel-angle error (target - measured)
+    (b) vehicle speed (caps reduce at higher speeds)
+- Adds smoothing + dv/dt limiting so it won’t chatter or spike.
+- Can be toggled with steer_vel_enable.
+"""
+
+from __future__ import annotations
 
 import time
-import signal
-from typing import Optional
+from dataclasses import dataclass
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy
-from rclpy.executors import SingleThreadedExecutor
-from std_msgs.msg import Bool
-
-# Autoware (Universe) commands
-from autoware_control_msgs.msg import Control as AwControl
-from autoware_vehicle_msgs.msg import (
-    GearCommand as AwGearCommand,
-    TurnIndicatorsCommand as AwTurnCmd,
-    HazardLightsCommand as AwHazCmd,
-    HazardLightsReport,                    # [+] SIM-ONLY status publisher
-    Engage as AwEngage,
+from rclpy.qos import (
+    QoSProfile,
+    QoSHistoryPolicy,
+    QoSReliabilityPolicy,
+    QoSDurabilityPolicy,
 )
 
-# Fallback (older Autoware.Auto)
-try:
-    from autoware_auto_control_msgs.msg import AckermannControlCommand as AutoAckermann
-except Exception:
-    AutoAckermann = None  # type: ignore
+from std_msgs.msg import Bool, Empty, UInt8
 
-# Dataspeed Ford DBW1 messages
+from autoware_control_msgs.msg import Control as AwControl
+from autoware_vehicle_msgs.msg import Engage as AwEngage
+from autoware_vehicle_msgs.msg import GearCommand as AwGearCommand
+from autoware_vehicle_msgs.msg import TurnIndicatorsCommand as AwTurnCmd
+from autoware_vehicle_msgs.msg import HazardLightsCommand as AwHazCmd
+
 from dbw_ford_msgs.msg import (
     ThrottleCmd,
     BrakeCmd,
     SteeringCmd,
     GearCmd,
     MiscCmd,
-    WheelSpeedReport,
-    GearReport,
+    SteeringReport as DbwSteeringReport,
+    GearReport as DbwGearReport,
 )
 
-def clamp(v: float, lo: float, hi: float) -> float:
-    return max(lo, min(hi, v))
 
-def _gear_name(g: Optional[int]) -> str:
-    names = {0:'NONE',1:'PARK',2:'REVERSE',3:'NEUTRAL',4:'DRIVE',5:'LOW'}
-    return names.get(g, f'{g}')
-
-def _extract_dbw_gear_value(state_obj) -> Optional[int]:
-    """Support nested dbw_ford_msgs/Gear (state.gear) or flat uint8."""
-    try:
-        return int(getattr(state_obj, 'gear'))
-    except Exception:
-        try:
-            return int(state_obj)
-        except Exception:
-            return None
-
-def _set_if_has(obj, field, value):
-    if hasattr(obj, field):
-        setattr(obj, field, value)
-
-def _set_turn_signal(msg_obj: MiscCmd, value_int: int) -> bool:
-    """Your vehicle layout: field is 'cmd' and nested has 'value'."""
-    if hasattr(msg_obj, 'cmd'):
-        slot = getattr(msg_obj, 'cmd')
-        if hasattr(slot, 'value'):
-            slot.value = int(value_int)
-            return True
-    return False
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
-class AutowareToDbw(Node):
-    def __init__(self):
-        super().__init__('autoware_to_dbw_can')
+def _const(msg_cls, name: str, default: int) -> int:
+    return int(getattr(msg_cls, name, default))
+
+
+@dataclass
+class _LastControl:
+    t_wall: float = 0.0
+    accel_mps2: float = 0.0
+    tire_angle_rad: float = 0.0
+
+
+class AutowareToDbwCan(Node):
+    # Shift state
+    _SHIFT_IDLE = 0
+    _SHIFT_PRE_BRAKE = 1
+    _SHIFT_SENT_CMD = 2
+    _SHIFT_POST_HOLD = 3
+
+    def __init__(self) -> None:
+        super().__init__("autoware_to_dbw_can")
 
         # QoS
         qos = QoSProfile(depth=10)
         qos.history = QoSHistoryPolicy.KEEP_LAST
         qos.reliability = QoSReliabilityPolicy.RELIABLE
 
-        # -------- Parameters (overridden by config/topics.yaml) --------
-        # Rates / safety
-        self.declare_parameter('rate_hz', 50)
-        self.declare_parameter('watchdog_ms', 200)
-        self.declare_parameter('enable_on_engage', False)
+        qos_gate = QoSProfile(depth=1)
+        qos_gate.history = QoSHistoryPolicy.KEEP_LAST
+        qos_gate.reliability = QoSReliabilityPolicy.RELIABLE
+        qos_gate.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
 
-        # Engage from vehicle_cmd_gate
-        self.declare_parameter('engage_msg_type', 'engage')  # 'engage' | 'bool'
-        self.declare_parameter('engage_topic', '/vehicle_cmd_gate/output/engage')
+        # ---- parameters ----
+        self.declare_parameter("rate_hz", 50.0)
+        self.declare_parameter("watchdog_ms", 100)
 
-        # Control message selection
-        self.declare_parameter('control_msg_type', 'control')  # 'control' | 'ackermann'
+        # Autoware topics
+        self.declare_parameter("aw_control_cmd", "/vehicle_cmd_gate/output/command/control_cmd")
+        self.declare_parameter("aw_gear_cmd", "/vehicle_cmd_gate/output/command/gear_cmd")
+        self.declare_parameter("aw_turn_cmd", "/vehicle_cmd_gate/output/command/turn_indicators_cmd")
+        self.declare_parameter("aw_hazard_cmd", "/vehicle_cmd_gate/output/command/hazard_lights_cmd")
+        self.declare_parameter("aw_engage", "/vehicle_cmd_gate/output/engage")
 
-        # Conversion (percent-based longitudinal)
-        self.declare_parameter('steering_wheel_to_tire_ratio', -14.8)   # tire(rad)→SW(rad)
-        self.declare_parameter('accel_to_percent_gain', 0.5)          # m/s^2 → 0..1
-        self.declare_parameter('max_throttle', 0.40)                   # 0..1 cap
-        self.declare_parameter('max_brake', 0.60)                      # 0..1 cap
+        # DBW command topics
+        self.declare_parameter("dbw_throttle_cmd", "/vehicle/throttle_cmd")
+        self.declare_parameter("dbw_brake_cmd", "/vehicle/brake_cmd")
+        self.declare_parameter("dbw_steering_cmd", "/vehicle/steering_cmd")
+        self.declare_parameter("dbw_gear_cmd", "/vehicle/gear_cmd")
+        self.declare_parameter("dbw_misc_cmd", "/vehicle/misc_cmd")
 
-        # Interlock (brake-to-shift) parameters
-        self.declare_parameter('gear_change_requires_brake', True)
-        self.declare_parameter('gear_change_brake_percent', 0.65)      # 65% brake hold during shift
-        self.declare_parameter('gear_change_speed_thresh', 0.2)        # m/s
-        self.declare_parameter('gear_change_timeout_ms', 1500)         # ms
-        self.declare_parameter('wheel_speed_units', 'mps')             # 'mps' or 'kph'
+        # DBW enable/disable topics (std_msgs/Empty)
+        self.declare_parameter("dbw_enable_topic", "/vehicle/enable")
+        self.declare_parameter("dbw_disable_topic", "/vehicle/disable")
+        self.declare_parameter("dbw_dbw_enabled", "/vehicle/dbw_enabled")
 
-        # Post-shift brake hold
-        self.declare_parameter('gear_post_shift_hold_ms', 1000)       # 1.0 s post-hold
-        self.declare_parameter('gear_post_shift_brake_percent', -1.0) # -1 → reuse gear_change_brake_percent
+        # DBW reports
+        self.declare_parameter("dbw_steering_report", "/vehicle/steering_report")  # speed + steering_wheel_angle
+        self.declare_parameter("dbw_gear_report", "/vehicle/gear_report")
 
-        # Gear diagnostics
-        self.declare_parameter('gear_diag_warn_after_ms', 700)
-        self.declare_parameter('gear_diag_log_interval_ms', 500)
+        # Hazard shim
+        self.declare_parameter("hazard_shim_topic", "/mkz_interface/hazard_cmd_latched")
+        self.declare_parameter("hazard_shim_timeout_ms", 2000)
 
-        # Autoware (gate) outputs
-        self.declare_parameter('aw_control_cmd', '/vehicle_cmd_gate/output/command/control_cmd')
-        self.declare_parameter('aw_gear_cmd',    '/vehicle_cmd_gate/output/command/gear_cmd')
-        self.declare_parameter('aw_turn_cmd',    '/vehicle_cmd_gate/output/command/turn_indicators_cmd')
-        self.declare_parameter('aw_hazard_cmd',  '/vehicle_cmd_gate/output/command/hazard_lights_cmd')
+        # Safety / gating
+        self.declare_parameter("require_engage", True)
+        self.declare_parameter("require_dbw_enabled", True)
+        self.declare_parameter("auto_enable_on_engage", False)
+        self.declare_parameter("publish_safe_zero_when_not_ready", True)
 
-        # DBW commands
-        self.declare_parameter('dbw_throttle_cmd', '/vehicle/throttle_cmd')
-        self.declare_parameter('dbw_brake_cmd',    '/vehicle/brake_cmd')
-        self.declare_parameter('dbw_steering_cmd', '/vehicle/steering_cmd')
-        self.declare_parameter('dbw_gear_cmd',     '/vehicle/gear_cmd')
-        self.declare_parameter('dbw_misc_cmd',     '/vehicle/misc_cmd')
-        self.declare_parameter('dbw_enable_cmd',   '/vehicle/enable')
-        self.declare_parameter('dbw_disable_cmd',  '/vehicle/disable')
+        # Vehicle constants
+        self.declare_parameter("steering_wheel_to_tire_ratio", 14.8)
+        self.declare_parameter("max_steering_wheel_angle_deg", 470.0)
 
-        # DBW feedback (enabled, speed, gear state)
-        self.declare_parameter('dbw_dbw_enabled',     '/vehicle/dbw_enabled')
-        self.declare_parameter('dbw_wheel_speed_report', '/vehicle/wheel_speed_report')
-        self.declare_parameter('dbw_gear_report',        '/vehicle/gear_report')
+        # Steering sign (+1 keeps Autoware convention, -1 flips)
+        self.declare_parameter("steering_sign", 1.0)
 
-        # NEW: pedal command type knobs (defaults: 1 = CMD_PEDAL)
-        self.declare_parameter('throttle_cmd_type', 1)  # 1 = CMD_PEDAL, 2 = CMD_PERCENT
-        self.declare_parameter('brake_cmd_type', 1)     # 1 = CMD_PEDAL, 2 = CMD_PERCENT
+        # Legacy fixed steering velocity (used if steer_vel_enable=false)
+        self.declare_parameter("steering_wheel_angle_velocity", 3.0)
 
-        # ---- Hazards (unsupported on Dataspeed DBW; sim-only status is optional)
-        self.declare_parameter('sim_publish_hazard_status', False)
-        self.declare_parameter('hazard_lights_status_topic', '/vehicle/status/hazard_lights_status')
+        # Intelligent steering velocity (safe defaults)
+        self.declare_parameter("steer_vel_enable", True)
+        self.declare_parameter("steer_vel_min", 3.0)          # rad/s minimum
+        self.declare_parameter("steer_vel_gain", 3.0)         # rad/s per rad of wheel-angle error
+        self.declare_parameter("steer_vel_tau", 0.25)         # seconds, low-pass on velocity command
+        self.declare_parameter("steer_vel_dv_max", 10.0)      # rad/s^2 max change rate of velocity
+        self.declare_parameter("steer_vel_cap_speeds", [0.0, 2.0, 10.0, 25.0, 35.0])  # m/s
+        self.declare_parameter("steer_vel_cap_vels",   [10.0, 9.0,  7.0,  5.0,  4.5]) # rad/s
+        self.declare_parameter("report_fresh_ms", 300)  # shared freshness for reports (speed/steer/gear)
 
-        # Pull params
-        p = {pp.name: pp.value for pp in self.get_parameters([
-            'rate_hz','watchdog_ms','enable_on_engage',
-            'engage_msg_type','engage_topic','control_msg_type',
-            'steering_wheel_to_tire_ratio','accel_to_percent_gain','max_throttle','max_brake',
-            'gear_change_requires_brake','gear_change_brake_percent','gear_change_speed_thresh','gear_change_timeout_ms',
-            'wheel_speed_units','gear_diag_warn_after_ms','gear_diag_log_interval_ms',
-            'aw_control_cmd','aw_gear_cmd','aw_turn_cmd','aw_hazard_cmd',
-            'dbw_throttle_cmd','dbw_brake_cmd','dbw_steering_cmd','dbw_gear_cmd','dbw_misc_cmd',
-            'dbw_enable_cmd','dbw_disable_cmd','dbw_dbw_enabled',
-            'dbw_wheel_speed_report','dbw_gear_report',
-            'throttle_cmd_type','brake_cmd_type',
-            'sim_publish_hazard_status','hazard_lights_status_topic',
-            'gear_post_shift_hold_ms','gear_post_shift_brake_percent',
-        ])}
+        # Longitudinal mapping (accel -> percent)
+        self.declare_parameter("accel_to_throttle_gain", 0.25)
+        self.declare_parameter("accel_to_brake_gain", 0.30)
+        self.declare_parameter("max_throttle", 0.25)
+        self.declare_parameter("max_brake", 0.40)
+        self.declare_parameter("throttle_deadband", 0.01)
+        self.declare_parameter("brake_deadband", 0.01)
 
-        self.rate_hz               = float(p['rate_hz'])
-        self.watchdog_ms           = int(p['watchdog_ms'])
-        self.enable_on_engage      = bool(p['enable_on_engage'])
-        self.engage_msg_type       = str(p['engage_msg_type']).lower()
-        self.engage_topic          = str(p['engage_topic'])
-        self.control_msg_type      = str(p['control_msg_type']).lower()
+        # Gear interlock (brake-to-shift)
+        self.declare_parameter("gear_change_requires_brake", True)
+        self.declare_parameter("gear_change_brake_percent", 0.70)
+        self.declare_parameter("gear_post_shift_hold_ms", 1000)
+        self.declare_parameter("gear_change_speed_thresh", 0.10)     # m/s
+        self.declare_parameter("gear_change_timeout_ms", 1500)
+        self.declare_parameter("gear_report_match_required", True)
 
-        self.st_ratio              = float(p['steering_wheel_to_tire_ratio'])
-        self.accel_to_percent_gain = float(p['accel_to_percent_gain'])
-        self.max_throttle          = float(p['max_throttle'])
-        self.max_brake             = float(p['max_brake'])
+        # ---- pull params ----
+        self.rate_hz = float(self.get_parameter("rate_hz").value)
+        self.watchdog_ms = int(self.get_parameter("watchdog_ms").value)
 
-        self.interlock_enabled     = bool(p['gear_change_requires_brake'])
-        self.interlock_brake_pct   = float(p['gear_change_brake_percent'])
-        self.interlock_speed_thr   = float(p['gear_change_speed_thresh'])
-        self.interlock_timeout_ms  = int(p['gear_change_timeout_ms'])
-        self.ws_units              = str(p['wheel_speed_units']).lower()
+        self.require_engage = bool(self.get_parameter("require_engage").value)
+        self.require_dbw_enabled = bool(self.get_parameter("require_dbw_enabled").value)
+        self.auto_enable_on_engage = bool(self.get_parameter("auto_enable_on_engage").value)
+        self.safe_zero = bool(self.get_parameter("publish_safe_zero_when_not_ready").value)
 
-        self.gear_diag_warn_after_ms   = int(p['gear_diag_warn_after_ms'])
-        self.gear_diag_log_interval_ms = int(p['gear_diag_log_interval_ms'])
+        self.ratio = float(self.get_parameter("steering_wheel_to_tire_ratio").value)
+        self.max_swa_rad = float(self.get_parameter("max_steering_wheel_angle_deg").value) * 3.1415926535 / 180.0
+        self.steering_sign = float(self.get_parameter("steering_sign").value)
 
-        self.aw_control_cmd = str(p['aw_control_cmd'])
-        self.aw_gear_cmd    = str(p['aw_gear_cmd'])
-        self.aw_turn_cmd    = str(p['aw_turn_cmd'])
-        self.aw_hazard_cmd  = str(p['aw_hazard_cmd'])
+        self.swa_vel_fixed = float(self.get_parameter("steering_wheel_angle_velocity").value)
 
-        self.dbw_throttle_cmd = str(p['dbw_throttle_cmd'])
-        self.dbw_brake_cmd    = str(p['dbw_brake_cmd'])
-        self.dbw_steering_cmd = str(p['dbw_steering_cmd'])
-        self.dbw_gear_cmd     = str(p['dbw_gear_cmd'])
-        self.dbw_misc_cmd     = str(p['dbw_misc_cmd'])
-        self.dbw_enable_cmd   = str(p['dbw_enable_cmd'])
-        self.dbw_disable_cmd  = str(p['dbw_disable_cmd'])
+        self.steer_vel_enable = bool(self.get_parameter("steer_vel_enable").value)
+        self.steer_vel_min = float(self.get_parameter("steer_vel_min").value)
+        self.steer_vel_gain = float(self.get_parameter("steer_vel_gain").value)
+        self.steer_vel_tau = float(self.get_parameter("steer_vel_tau").value)
+        self.steer_vel_dv_max = float(self.get_parameter("steer_vel_dv_max").value)
+        self.steer_vel_cap_speeds = list(self.get_parameter("steer_vel_cap_speeds").value)
+        self.steer_vel_cap_vels = list(self.get_parameter("steer_vel_cap_vels").value)
 
-        self.dbw_dbw_enabled     = str(p['dbw_dbw_enabled'])
-        self.dbw_wheel_speed_report = str(p['dbw_wheel_speed_report'])
-        self.dbw_gear_report        = str(p['dbw_gear_report'])
+        self.report_fresh_ms = int(self.get_parameter("report_fresh_ms").value)
+        self.hazard_shim_timeout_ms = int(self.get_parameter("hazard_shim_timeout_ms").value)
 
-        # Brake hold
-        self.post_hold_ms = int(p['gear_post_shift_hold_ms'])
-        _gpsbp = float(p['gear_post_shift_brake_percent'])
-        self.post_hold_brake_pct = _gpsbp if _gpsbp >= 0.0 else self.interlock_brake_pct
+        self.k_th = float(self.get_parameter("accel_to_throttle_gain").value)
+        self.k_br = float(self.get_parameter("accel_to_brake_gain").value)
+        self.max_th = float(self.get_parameter("max_throttle").value)
+        self.max_br = float(self.get_parameter("max_brake").value)
+        self.db_th = float(self.get_parameter("throttle_deadband").value)
+        self.db_br = float(self.get_parameter("brake_deadband").value)
 
+        self.gear_change_requires_brake = bool(self.get_parameter("gear_change_requires_brake").value)
+        self.gear_change_brake_percent = float(self.get_parameter("gear_change_brake_percent").value)
+        self.gear_post_shift_hold_ms = int(self.get_parameter("gear_post_shift_hold_ms").value)
+        self.gear_change_speed_thresh = float(self.get_parameter("gear_change_speed_thresh").value)
+        self.gear_change_timeout_ms = int(self.get_parameter("gear_change_timeout_ms").value)
+        self.gear_report_match_required = bool(self.get_parameter("gear_report_match_required").value)
 
-        # NEW: assign pedal types
-        self.throttle_cmd_type = int(p['throttle_cmd_type'])
-        self.brake_cmd_type    = int(p['brake_cmd_type'])
+        # Sanity: cap arrays must match
+        if len(self.steer_vel_cap_speeds) != len(self.steer_vel_cap_vels) or len(self.steer_vel_cap_speeds) < 2:
+            self.get_logger().warn("steer_vel_cap_* arrays invalid; falling back to fixed cap (6 rad/s).")
+            self.steer_vel_cap_speeds = [0.0, 35.0]
+            self.steer_vel_cap_vels = [6.0, 6.0]
 
-        # Hazards (sim-only status option)
-        self._sim_publish_hazard_status = bool(p['sim_publish_hazard_status'])
-        self._hazard_status_topic = str(p['hazard_lights_status_topic'])
-        self._hazard_warned_once = False
+        # ---- pubs ----
+        self.pub_thr = self.create_publisher(ThrottleCmd, self.get_parameter("dbw_throttle_cmd").value, qos)
+        self.pub_brk = self.create_publisher(BrakeCmd, self.get_parameter("dbw_brake_cmd").value, qos)
+        self.pub_str = self.create_publisher(SteeringCmd, self.get_parameter("dbw_steering_cmd").value, qos)
+        self.pub_gear = self.create_publisher(GearCmd, self.get_parameter("dbw_gear_cmd").value, qos)
+        self.pub_misc = self.create_publisher(MiscCmd, self.get_parameter("dbw_misc_cmd").value, qos)
 
-        # -------- Publishers (DBW) --------
-        self.pub_throttle = self.create_publisher(ThrottleCmd, self.dbw_throttle_cmd, qos)
-        self.pub_brake    = self.create_publisher(BrakeCmd,    self.dbw_brake_cmd,    qos)
-        self.pub_steer    = self.create_publisher(SteeringCmd, self.dbw_steering_cmd, qos)
-        self.pub_gear     = self.create_publisher(GearCmd,     self.dbw_gear_cmd,     qos)
-        self.pub_misc     = self.create_publisher(MiscCmd,     self.dbw_misc_cmd,     qos)
-        self.pub_enable   = self.create_publisher(Bool,        self.dbw_enable_cmd,   qos)
-        self.pub_disable  = self.create_publisher(Bool,        self.dbw_disable_cmd,  qos)
-        # Publisher for SIM-ONLY hazard status (no DBW actuation)
-        self._pub_hazard_status = self.create_publisher(HazardLightsReport, self._hazard_status_topic, 10)
+        self.pub_enable = self.create_publisher(Empty, self.get_parameter("dbw_enable_topic").value, qos)
+        self.pub_disable = self.create_publisher(Empty, self.get_parameter("dbw_disable_topic").value, qos)
 
-        # -------- Subscriptions --------
-        # Engage
-        if self.engage_msg_type == 'engage':
-            self.sub_engage = self.create_subscription(AwEngage, self.engage_topic, self.on_engage_msg, qos)
-        else:
-            self.sub_engage = self.create_subscription(Bool, self.engage_topic, self.on_engage_bool, qos)
+        self.pub_hazard_shim = self.create_publisher(UInt8, self.get_parameter("hazard_shim_topic").value, qos)
 
-        # DBW enable feedback
-        self.sub_dbw_en = self.create_subscription(Bool, self.dbw_dbw_enabled, self.on_dbw_enabled, qos)
+        # ---- subs ----
+        self.create_subscription(AwEngage, self.get_parameter("aw_engage").value, self._on_engage, qos)
+        self.create_subscription(AwControl, self.get_parameter("aw_control_cmd").value, self._on_control, qos_gate)
+        self.create_subscription(AwGearCommand, self.get_parameter("aw_gear_cmd").value, self._on_gear_cmd, qos)
+        self.create_subscription(AwTurnCmd, self.get_parameter("aw_turn_cmd").value, self._on_turn, qos)
+        self.create_subscription(AwHazCmd, self.get_parameter("aw_hazard_cmd").value, self._on_hazard, qos)
+        self.create_subscription(Bool, self.get_parameter("dbw_dbw_enabled").value, self._on_dbw_enabled, qos_gate)
 
-        # Control (AW)
-        if self.control_msg_type == 'control':
-            self.sub_control = self.create_subscription(AwControl, self.aw_control_cmd, self.on_control_control, qos)
-            self.using_control = True
-        else:
-            if AutoAckermann is None:
-                self.get_logger().warn("control_msg_type=ackermann requested but autoware_auto_control_msgs not available; using 'control'")
-                self.sub_control = self.create_subscription(AwControl, self.aw_control_cmd, self.on_control_control, qos)
-                self.using_control = True
-            else:
-                self.sub_control = self.create_subscription(AutoAckermann, self.aw_control_cmd, self.on_control_ackermann, qos)
-                self.using_control = False
+        self.create_subscription(DbwSteeringReport, self.get_parameter("dbw_steering_report").value, self._on_steering_report, qos)
+        self.create_subscription(DbwGearReport, self.get_parameter("dbw_gear_report").value, self._on_gear_report, qos)
 
-        # Ancillary (AW)
-        self.sub_gear   = self.create_subscription(AwGearCommand, self.aw_gear_cmd,   self.on_gear_request, qos)
-        self.sub_turn   = self.create_subscription(AwTurnCmd,     self.aw_turn_cmd,   self.on_turn,   qos)
-        self.sub_hazard = self.create_subscription(AwHazCmd,      self.aw_hazard_cmd, self.on_hazard, qos)
+        # ---- state ----
+        self.engaged = False
+        self.dbw_enabled = False
 
-        # Feedback (speed, gear state)
-        self.sub_ws   = self.create_subscription(WheelSpeedReport, self.dbw_wheel_speed_report, self.on_wheel_speeds, qos)
-        self.sub_grep = self.create_subscription(GearReport,        self.dbw_gear_report,        self.on_dbw_gear_report, qos)
+        self.ctrl = _LastControl()
+        self._count = 0
 
-        # -------- State --------
-        self.engaged: bool = False
-        self.dbw_enabled: bool = False
-        self.last_accel: float = 0.0
-        self.last_tire_angle: float = 0.0
-        self.last_cmd_time: Optional[float] = None
+        # hazard shim state
+        self.last_hazard = 0
+        self.last_hazard_t = 0.0
 
-        # Latest Autoware turn/hazard
-        self._aw_turn_cmd: int = 0
-        self._aw_hazard_cmd: int = 0
+        # Turn policy: publish MiscCmd only in short bursts
+        self._aw_turn_cmd = 1
+        self._hazards_continuous = False  # hazards not actuated
+        self._turn_burst_until = None
+        self._turn_value = 0  # 0 none, 1 left, 2 right
 
-        # Turn/hazard policy
-        self._hazards_continuous: bool = False
-        self._turn_burst_until: Optional[float] = None
-        self._turn_value: int = 0  # 0/1/2 (NONE/LEFT/RIGHT)
+        # DBW report caches
+        self.last_speed_mps = 0.0
+        self.last_speed_t = 0.0
+        self.last_wheel_angle_rad = 0.0
+        self.last_wheel_angle_t = 0.0
+        self.last_dbw_gear = 0
+        self.last_dbw_gear_t = 0.0
 
-        # Speed + gear feedback
-        self.current_speed_mps: float = 0.0
-        self.current_dbw_gear: Optional[int] = None
+        # Intelligent steer velocity internal state
+        self._steer_vel_cmd = float(_clamp(self.swa_vel_fixed, 0.0, 17.5))
+        self._steer_vel_t = time.time()
 
-        # Interlock FSM
-        self.pending_gear_dbw: Optional[int] = None
-        self.interlock_deadline: Optional[float] = None
-        self.interlock_active: bool = False
-        self.post_hold_deadline: Optional[float] = None
+        # Shift FSM
+        self.shift_state = self._SHIFT_IDLE
+        self.shift_target_dbw_gear = 0
+        self.shift_t0 = 0.0
+        self.shift_t_phase = 0.0
+        self.shift_cmd_sent = False
 
-        # Shutdown coordination
-        self._shutdown_requested = False
-
-        self.count = 0
-        self.dt = 1.0 / max(1.0, self.rate_hz)
-        self.timer = self.create_timer(self.dt, self.on_timer)
+        self.timer = self.create_timer(1.0 / max(1.0, self.rate_hz), self._on_timer)
 
         self.get_logger().info(
-            f'Autoware→DBW bridge @ {self.rate_hz:.1f} Hz '
-            f'(longitudinal={"pedal" if self.throttle_cmd_type==1 else "percent"}, interlock={"on" if self.interlock_enabled else "off"})'
+            "MKZ cmd bridge ready. Throttle/Brake CMD_PERCENT. Turn signals burst-mode. "
+            f"Gear interlock: {'ON' if self.gear_change_requires_brake else 'OFF'}. "
+            f"Intelligent steer vel: {'ON' if self.steer_vel_enable else 'OFF'}."
         )
 
-    # ================= Engage & enable =================
-    def on_engage_msg(self, msg: AwEngage):
-        prev = self.engaged
-        self.engaged = bool(msg.engage)
-        self._handle_engage_edge(prev)
+    # -------- small utils --------
+    def _bump(self) -> int:
+        self._count = (self._count + 1) & 0xFF
+        return self._count
 
-    def on_engage_bool(self, msg: Bool):
-        prev = self.engaged
-        self.engaged = bool(msg.data)
-        self._handle_engage_edge(prev)
+    def _stamp(self, msg) -> None:
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = "base_link"
 
-    def _handle_engage_edge(self, prev: bool):
-        if self.enable_on_engage and (not prev) and self.engaged:
-            self.get_logger().info('Engage↑ → DBW enable request')
-            self.pub_enable.publish(Bool(data=True))
-        if prev and (not self.engaged):
-            self.get_logger().info('Engage↓ → safe_zero (+ optional disable)')
-            self.safe_zero()
-            if self.enable_on_engage:
-                self.pub_disable.publish(Bool(data=True))
+    def _ready(self) -> bool:
+        if self.require_engage and (not self.engaged):
+            return False
+        if self.require_dbw_enabled and (not self.dbw_enabled):
+            return False
+        return True
 
-    def on_dbw_enabled(self, msg: Bool):
+    def _control_fresh(self, now: float) -> bool:
+        return self.ctrl.t_wall > 0.0 and (now - self.ctrl.t_wall) * 1000.0 <= float(self.watchdog_ms)
+
+    def _report_fresh(self, t_wall: float) -> bool:
+        if t_wall <= 0.0:
+            return False
+        return (time.time() - t_wall) * 1000.0 <= float(self.report_fresh_ms)
+
+    # -------- callbacks --------
+    def _on_engage(self, msg: AwEngage) -> None:
+        new_engaged = bool(msg.engage)
+        if new_engaged and (not self.engaged) and self.auto_enable_on_engage:
+            self.pub_enable.publish(Empty())
+        if (not new_engaged) and self.engaged and self.auto_enable_on_engage:
+            self.pub_disable.publish(Empty())
+        self.engaged = new_engaged
+
+    def _on_dbw_enabled(self, msg: Bool) -> None:
         self.dbw_enabled = bool(msg.data)
+        if not self.dbw_enabled and self.shift_state != self._SHIFT_IDLE:
+            self.get_logger().warn("DBW disabled during shift; aborting shift FSM.")
+            self._shift_abort()
 
-    # ================= Feedback used by interlock =================
-    def on_wheel_speeds(self, msg: WheelSpeedReport):
-        v = float(msg.front_left + msg.front_right + msg.rear_left + msg.rear_right) / 4.0
-        if self.ws_units == 'kph':
-            v = v / 3.6
-        self.current_speed_mps = v
+    def _on_control(self, msg: AwControl) -> None:
+        self.ctrl.accel_mps2 = float(msg.longitudinal.acceleration)
+        self.ctrl.tire_angle_rad = float(msg.lateral.steering_tire_angle)
+        self.ctrl.t_wall = time.time()
 
-    def on_dbw_gear_report(self, msg: GearReport):
-        g = _extract_dbw_gear_value(msg.state)
-        if g is None:
-            self.get_logger().warn('GearReport.state has unexpected type/layout')
-            return
-        self.current_dbw_gear = g
-        if self.pending_gear_dbw is not None and self.current_dbw_gear == self.pending_gear_dbw:
-            self.get_logger().info(
-                f'Gear confirmed by DBW: {self.current_dbw_gear} ({_gear_name(self.current_dbw_gear)})'
-            )
-            self.pending_gear_dbw = None
-            self.interlock_active = False
-            self.interlock_deadline = None
-            self.post_hold_deadline = time.time() + self.post_hold_ms / 1000.0
-            return
+    def _on_turn(self, msg: AwTurnCmd) -> None:
+        self._aw_turn_cmd = int(getattr(msg, "command", 0))
+        self._recalc_turn_policy()
 
-    # ================= Control callbacks =================
-    def on_control_control(self, cmd: AwControl):
+    def _on_hazard(self, msg: AwHazCmd) -> None:
+        # Hazards not actuated; keep shim only
+        self.last_hazard = int(msg.command)
+        self.last_hazard_t = time.time()
+        u = UInt8()
+        u.data = int(self.last_hazard)
+        self.pub_hazard_shim.publish(u)
+
+        # Ensure hazard does NOT affect turn behavior
+        self._hazards_continuous = False
+
+    def _on_steering_report(self, msg: DbwSteeringReport) -> None:
+        # DBW SteeringReport has:
+        # - steering_wheel_angle (rad)
+        # - speed (m/s)
         try:
-            self.last_accel = float(cmd.longitudinal.acceleration)
+            self.last_speed_mps = float(msg.speed)
         except Exception:
-            self.last_accel = 0.0
+            self.last_speed_mps = 0.0
+        self.last_speed_t = time.time()
+
         try:
-            self.last_tire_angle = float(cmd.lateral.steering_tire_angle)
+            self.last_wheel_angle_rad = float(msg.steering_wheel_angle)
         except Exception:
-            self.last_tire_angle = 0.0
-        self.last_cmd_time = time.time()
+            # keep previous
+            pass
+        self.last_wheel_angle_t = time.time()
 
-    def on_control_ackermann(self, cmd: 'AutoAckermann'):
-        self.last_accel = float(cmd.longitudinal.acceleration)
-        self.last_tire_angle = float(cmd.lateral.steering_tire_angle)
-        self.last_cmd_time = time.time()
-
-    # ================= Ancillary: gear / turns / hazard =================
-    def on_gear_request(self, cmd: AwGearCommand):
-        # Keep your existing mapping as-is (no behavior changes requested here).
-        aw = int(getattr(cmd, "command", 0))
-        if aw == 0:                dbw = 0  # NONE
-        elif aw == 3:              dbw = 3  # NEUTRAL (your build)
-        elif 2 <= aw <= 19:        dbw = 4  # DRIVE and DRIVE_*
-        elif aw in (20, 21):       dbw = 2  # REVERSE / REVERSE_2
-        elif aw == 1:             dbw = 1  # PARK
-        elif aw in (4, 23, 24):       dbw = 5  # LOW / LOW_2
-        else:                      dbw = 0  # default NONE
-
-        if not self.interlock_enabled:
-            self._publish_gear_cmd(dbw)
-            return
-
-        if self.current_speed_mps > self.interlock_speed_thr:
-            self.get_logger().warn(
-                f'Gear change requested at {self.current_speed_mps:.2f} m/s (> {self.interlock_speed_thr}); ignoring'
-            )
-            return
-
-        self.pending_gear_dbw = dbw
-        self.interlock_active = True
-        self.interlock_deadline = time.time() + self.interlock_timeout_ms / 1000.0
-
-        self.get_logger().info(
-            f'Gear change request → DBW:{dbw} ({_gear_name(dbw)})'
-            f'; applying {self.interlock_brake_pct*100:.0f}% brake hold and issuing shift'
-        )
-
-        self._publish_gear_cmd(dbw)
-
-    def _publish_gear_cmd(self, dbw_gear: int):
-        if not self._ok_to_send():
-            return
-        m = GearCmd()
-        _set_if_has(m, 'enable', True)
-        _set_if_has(m, 'clear', False)
-        _set_if_has(m, 'ignore', False)
-        if hasattr(m, 'count'):
-            m.count = self._bump()
+    def _on_gear_report(self, msg: DbwGearReport) -> None:
+        g = 0
         try:
-            m.cmd.gear = dbw_gear
-        except AttributeError:
-            m.cmd = dbw_gear
-        self.pub_gear.publish(m)
+            g = int(msg.state.gear)
+        except Exception:
+            try:
+                g = int(msg.state)
+            except Exception:
+                g = 0
+        self.last_dbw_gear = g
+        self.last_dbw_gear_t = time.time()
 
-    def on_hazard(self, cmd: AwHazCmd):
-        """
-        Dataspeed DBW (MKZ) cannot actuate hazards. Ignore the command with a one-time WARN.
-        Optionally, for SIM ONLY, publish HazardLightsReport so RViz/Planning Sim can visualize it.
-        """
-        if not self._hazard_warned_once:
-            self.get_logger().warn(
-                "Hazard lights are not controllable via Dataspeed DBW on the MKZ. "
-                "Ignoring HazardLightsCommand (this warning prints once)."
-            )
-            self._hazard_warned_once = True
-
-        # Ensure hazards do NOT affect MiscCmd/turn policy on the real vehicle
-        self._aw_hazard_cmd = 1  # force DISABLE in our internal policy
-        # (keep existing _aw_turn_cmd as-is; user did not request turn mapping changes)
-        self._recalc_misc_policy()
-
-        # SIM-ONLY: echo as status for visualization
-        if not self._sim_publish_hazard_status:
+    def _on_gear_cmd(self, msg: AwGearCommand) -> None:
+        desired_dbw = int(self._map_aw_gear_to_dbw(int(msg.command)))
+        if desired_dbw == 0:
             return
-        rep = HazardLightsReport()
-        rep.stamp = self.get_clock().now().to_msg()
-        cmd_val = int(getattr(cmd, "command", 0))
-        if cmd_val == AwHazCmd.ENABLE:
-            rep.report = HazardLightsReport.ENABLE
-        elif cmd_val == AwHazCmd.DISABLE:
-            rep.report = HazardLightsReport.DISABLE
-        else:
-            return  # NO_COMMAND
-        self._pub_hazard_status.publish(rep)
 
-    def on_turn(self, cmd: AwTurnCmd):
-        self._aw_hazard_cmd = 1
-        self._aw_turn_cmd = int(getattr(cmd, "command", 0))
-        self._recalc_misc_policy()
+        if not self.gear_change_requires_brake:
+            self._publish_gear_cmd(desired_dbw)
+            return
 
-    def _recalc_misc_policy(self):
-        # TurnIndicatorsCommand {DISABLE=1, LEFT=2, RIGHT=3}
-        # HazardLightsCommand   {DISABLE=1, ENABLE=2}
-        if self._aw_hazard_cmd == 2:
-            self._hazards_continuous = True
-            self._turn_burst_until = None
-            self._turn_value = 0
-        else:
-            self._hazards_continuous = False
-            if self._aw_turn_cmd == 2:
-                self._turn_value = 1  # LEFT
-                self._turn_burst_until = time.time() + 0.5
-            elif self._aw_turn_cmd == 3:
-                self._turn_value = 2  # RIGHT
-                self._turn_burst_until = time.time() + 0.5
-            else:
-                self._turn_value = 0
-                self._turn_burst_until = time.time() + 0.2
+        if not self._ready():
+            self.get_logger().warn("Ignoring gear command (not ready: engage/dbw_enabled gating).")
+            return
 
-    # ================= Timer loop =================
-    def on_timer(self):
+        if self.last_dbw_gear == desired_dbw and self._report_fresh(self.last_dbw_gear_t):
+            return
+
+        # If already shifting, retarget
+        if self.shift_state != self._SHIFT_IDLE:
+            if desired_dbw != self.shift_target_dbw_gear:
+                self.get_logger().warn(
+                    f"New gear request while shifting: retarget {self.shift_target_dbw_gear} -> {desired_dbw}"
+                )
+                self.shift_target_dbw_gear = desired_dbw
+                self.shift_t0 = time.time()
+                self.shift_t_phase = self.shift_t0
+                self.shift_state = self._SHIFT_PRE_BRAKE
+                self.shift_cmd_sent = False
+            return
+
+        self.shift_target_dbw_gear = desired_dbw
+        self.shift_t0 = time.time()
+        self.shift_t_phase = self.shift_t0
+        self.shift_state = self._SHIFT_PRE_BRAKE
+        self.shift_cmd_sent = False
+        self.get_logger().info(f"Starting brake-to-shift: target_dbw_gear={desired_dbw}")
+
+    # -------- turn burst helpers --------
+    def _recalc_turn_policy(self) -> None:
+        # Your working values: 1=DISABLE, 2=LEFT, 3=RIGHT (0 may be NO_COMMAND)
         now = time.time()
+        self._hazards_continuous = False
 
-        # ---- Longitudinal heartbeat and commands (gated by engage+dbw_enabled) ----
-        if (self.last_cmd_time is None) or ((now - self.last_cmd_time) * 1000.0 > self.watchdog_ms):
-            self.safe_zero()
+        c = int(self._aw_turn_cmd)
+        if c == 2:
+            self._turn_value = 1  # LEFT
+            self._turn_burst_until = now + 0.5
+        elif c == 3:
+            self._turn_value = 2  # RIGHT
+            self._turn_burst_until = now + 0.5
         else:
-            if not self._ok_to_send():
-                self.safe_zero()
-            else:
-                accel = float(self.last_accel)
-                throttle_pct = 0.0
-                brake_pct = 0.0
-                if accel >= 0.0:
-                    throttle_pct = clamp(accel * self.accel_to_percent_gain, 0.0, self.max_throttle)
-                    brake_pct = 0.0
-                else:
-                    brake_pct = clamp(-accel * self.accel_to_percent_gain, 0.0, self.max_brake)
-                    throttle_pct = 0.0
+            self._turn_value = 0  # OFF
+            self._turn_burst_until = now + 0.2
 
-                # Interlock override: keep brake applied and zero throttle while shifting
-                if self.interlock_active:
-                    throttle_pct = 0.0
-                    brake_pct = max(brake_pct, self.interlock_brake_pct)
-                    if self.pending_gear_dbw is not None:
-                        self._publish_gear_cmd(self.pending_gear_dbw)
-                    if self.interlock_deadline and now > self.interlock_deadline:
-                        self.pending_gear_dbw = None
-                        self.interlock_active = False
-                        self.interlock_deadline = None
-                # Post-shift hold window (zero throttle + hold brake for extra time)
-                if self.post_hold_deadline:
-                    if now <= self.post_hold_deadline:
-                        throttle_pct = 0.0
-                        brake_pct = max(brake_pct, self.post_hold_brake_pct)
-                    else:
-                        self.post_hold_deadline = None
-
-                # Lateral: tire angle(rad) → steering wheel angle(rad)
-                swa_cmd = clamp(self.last_tire_angle * self.st_ratio, -8.0, 8.0)
-
-                self.pub_throttle.publish(self._mk_throttle_percent(throttle_pct))
-                self.pub_brake.publish(self._mk_brake_percent(brake_pct))
-                self.pub_steer.publish(self._mk_steer_angle(swa_cmd, swa_vel=3.0))
-
-        # ---- MiscCmd policy ----
-        send_value: Optional[int] = None
+    def _publish_misc_if_needed(self, now: float) -> None:
+        send_value = None
         if self._hazards_continuous:
-            send_value = 3  # HAZARD continuously
-        elif self._turn_burst_until and now < self._turn_burst_until:
+            send_value = 3  # HAZARD (not used)
+        elif self._turn_burst_until is not None and now < float(self._turn_burst_until):
             send_value = int(self._turn_value)
         else:
             self._turn_burst_until = None
 
-        if send_value is not None:
-            m = MiscCmd()
-            if hasattr(m, 'count'):
-                m.count = self._bump()
-            _set_turn_signal(m, send_value)
-            self.pub_misc.publish(m)
+        if send_value is None:
+            return
 
-    # ================= Helpers =================
-    def _ok_to_send(self) -> bool:
-        return self.engaged and self.dbw_enabled
+        m = MiscCmd()
+        self._stamp(m)
+        m.cmd.value = int(send_value)  # 0 NONE, 1 LEFT, 2 RIGHT
+        m.pbrk.cmd = 0
+        self.pub_misc.publish(m)
 
-    def _bump(self) -> int:
-        self.count = (self.count + 1) & 0xFF
-        return self.count
+    # -------- intelligent steering velocity helpers --------
+    def _interp_cap(self, speed_mps: float) -> float:
+        # Piecewise-linear interpolation over (cap_speeds, cap_vels)
+        s = float(speed_mps)
+        xs = self.steer_vel_cap_speeds
+        ys = self.steer_vel_cap_vels
 
-    def _mk_throttle_percent(self, percent: float) -> ThrottleCmd:
-        msg = ThrottleCmd()
-        _set_if_has(msg, 'enable', True)
-        _set_if_has(msg, 'clear', False)
-        _set_if_has(msg, 'ignore', False)
+        if s <= float(xs[0]):
+            return float(ys[0])
+        if s >= float(xs[-1]):
+            return float(ys[-1])
 
-        # Autoware expresses intent as 0..1 "percent"
-        p = clamp(float(percent), 0.0, 1.0)
+        for i in range(len(xs) - 1):
+            x0 = float(xs[i])
+            x1 = float(xs[i + 1])
+            if x0 <= s <= x1:
+                y0 = float(ys[i])
+                y1 = float(ys[i + 1])
+                if abs(x1 - x0) < 1e-9:
+                    return float(min(y0, y1))
+                t = (s - x0) / (x1 - x0)
+                return float(y0 + t * (y1 - y0))
 
-        if int(self.throttle_cmd_type) == 1:  # CMD_PEDAL (unitless, valid 0.15..0.80)
-            # Floor-only mapping: preserve magnitude (no amplification), just ensure minimum is met.
-            if p <= 0.0:
-                cmd = 0.0
+        return float(ys[-1])
+
+    def _compute_steer_velocity(self, now: float, target_wheel_angle: float) -> float:
+        # Fallback to fixed velocity if disabled
+        if not self.steer_vel_enable:
+            return float(_clamp(self.swa_vel_fixed, 0.0, 17.5))
+
+        # Use measured wheel angle if fresh, else fall back to last commanded target
+        if self._report_fresh(self.last_wheel_angle_t):
+            wheel_cur = float(self.last_wheel_angle_rad)
+        else:
+            # If we don't have fresh feedback, be conservative: assume we are at previous target.
+            wheel_cur = float(target_wheel_angle)
+
+        # Speed (fresh -> use; else conservative mid-speed cap)
+        if self._report_fresh(self.last_speed_t):
+            spd = float(abs(self.last_speed_mps))
+        else:
+            spd = 10.0  # conservative assumption
+
+        cap = float(_clamp(self._interp_cap(spd), 0.0, 17.5))
+
+        err = abs(float(target_wheel_angle) - float(wheel_cur))
+        v_req = float(self.steer_vel_min + self.steer_vel_gain * err)
+        v_req = float(_clamp(v_req, self.steer_vel_min, cap))
+
+        # Smooth + dv/dt limit
+        dt = max(1e-3, float(now - self._steer_vel_t))
+        self._steer_vel_t = float(now)
+
+        # First-order low-pass on velocity command
+        tau = max(1e-3, float(self.steer_vel_tau))
+        alpha = dt / (tau + dt)
+        v_filt = float(self._steer_vel_cmd + alpha * (v_req - self._steer_vel_cmd))
+
+        # dv/dt limiting
+        dv_max = max(0.0, float(self.steer_vel_dv_max)) * dt
+        v_limited = float(_clamp(v_filt, self._steer_vel_cmd - dv_max, self._steer_vel_cmd + dv_max))
+
+        self._steer_vel_cmd = float(_clamp(v_limited, self.steer_vel_min, cap))
+        return float(_clamp(self._steer_vel_cmd, 0.0, 17.5))
+
+    # -------- DBW cmd builders --------
+    def _build_throttle(self, percent: float) -> ThrottleCmd:
+        m = ThrottleCmd()
+        self._stamp(m)
+        m.pedal_cmd_type = _const(ThrottleCmd, "CMD_PERCENT", 2)
+        m.pedal_cmd = float(_clamp(percent, 0.0, 1.0))
+        m.enable = True
+        m.clear = False
+        m.ignore = False
+        m.count = self._bump()
+        return m
+
+    def _build_brake(self, percent: float) -> BrakeCmd:
+        m = BrakeCmd()
+        self._stamp(m)
+        m.pedal_cmd_type = _const(BrakeCmd, "CMD_PERCENT", 2)
+        m.pedal_cmd = float(_clamp(percent, 0.0, 1.0))
+        m.enable = True
+        m.clear = False
+        m.ignore = False
+        m.count = self._bump()
+        return m
+
+    def _build_steering(self, now: float, tire_angle_rad: float) -> SteeringCmd:
+        # Autoware convention: positive tire_angle is LEFT (in FLU). steering_sign allows flipping if needed.
+        wheel_target = float(self.steering_sign) * float(tire_angle_rad) * float(self.ratio)
+        wheel_target = float(_clamp(wheel_target, -self.max_swa_rad, self.max_swa_rad))
+
+        vel = self._compute_steer_velocity(now, wheel_target)
+
+        m = SteeringCmd()
+        self._stamp(m)
+        m.enable = True
+        m.clear = False
+        m.ignore = False
+        m.cmd_type = _const(SteeringCmd, "CMD_ANGLE", 0)
+        m.steering_wheel_angle_cmd = float(wheel_target)
+        m.steering_wheel_angle_velocity = float(vel)
+        m.count = self._bump()
+        return m
+
+    def _publish_gear_cmd(self, desired_dbw: int) -> None:
+        g = GearCmd()
+        self._stamp(g)
+        g.cmd.gear = int(desired_dbw)
+        g.clear = False
+        self.pub_gear.publish(g)
+
+    # -------- shift FSM --------
+    def _shift_abort(self) -> None:
+        self.shift_state = self._SHIFT_IDLE
+        self.shift_target_dbw_gear = 0
+        self.shift_t0 = 0.0
+        self.shift_t_phase = 0.0
+        self.shift_cmd_sent = False
+
+    def _run_shift(self, now: float) -> None:
+        if not self._ready():
+            self.get_logger().warn("Not ready during shift; aborting shift.")
+            self._shift_abort()
+            return
+
+        if (now - self.shift_t0) * 1000.0 > float(self.gear_change_timeout_ms):
+            self.get_logger().warn("Shift timed out; aborting shift.")
+            self._shift_abort()
+            return
+
+        # Always override longitudinal during shift
+        brk = float(_clamp(self.gear_change_brake_percent, 0.0, 1.0))
+        self.pub_thr.publish(self._build_throttle(0.0))
+        self.pub_brk.publish(self._build_brake(brk))
+
+        # Keep steering based on last control if fresh
+        tire = self.ctrl.tire_angle_rad if self._control_fresh(now) else 0.0
+        self.pub_str.publish(self._build_steering(now, tire))
+
+        # Turn signals: burst-only
+        self._publish_misc_if_needed(now)
+
+        speed_ok = False
+        if self._report_fresh(self.last_speed_t):
+            speed_ok = abs(self.last_speed_mps) <= float(self.gear_change_speed_thresh)
+
+        if self.shift_state == self._SHIFT_PRE_BRAKE:
+            if speed_ok:
+                self.shift_state = self._SHIFT_SENT_CMD
+                self.shift_t_phase = now
+                self.shift_cmd_sent = False
             else:
-                cmd = max(((p*0.65)+0.15), 0.15)   # keep p as-is if >= 0.15; bump tiny p to 0.15 so PARK reacts
-                cmd = min(cmd, 0.80)     # respect pedal upper bound
-        else:  # CMD_PERCENT (0..1)
-            cmd = p
+                return
 
-        msg.pedal_cmd = float(cmd)
-        _set_if_has(msg, 'pedal_cmd_type', int(self.throttle_cmd_type))
-        if hasattr(msg, 'count'):
-            msg.count = self._bump()
-        return msg
+        if self.shift_state == self._SHIFT_SENT_CMD:
+            if not self.shift_cmd_sent:
+                self._publish_gear_cmd(self.shift_target_dbw_gear)
+                self.shift_cmd_sent = True
+                self.shift_t_phase = now
 
-
-    def _mk_brake_percent(self, percent: float) -> BrakeCmd:
-        msg = BrakeCmd()
-        _set_if_has(msg, 'enable', True)
-        _set_if_has(msg, 'clear', False)
-        _set_if_has(msg, 'ignore', False)
-
-        p = clamp(float(percent), 0.0, 1.0)
-
-        if int(self.brake_cmd_type) == 1:  # CMD_PEDAL (unitless, valid 0.15..0.50)
-            if p <= 0.0:
-                cmd = 0.0
+            if self.gear_report_match_required and self._report_fresh(self.last_dbw_gear_t):
+                if self.last_dbw_gear == self.shift_target_dbw_gear:
+                    self.shift_state = self._SHIFT_POST_HOLD
+                    self.shift_t_phase = now
+                else:
+                    return
             else:
-                cmd = max(((p*0.65)+0.15), 0.15)   # only floor tiny values; otherwise keep p unchanged
-                cmd = min(cmd, 0.80)     # respect pedal upper bound
-        else:  # CMD_PERCENT (0..1)
-            cmd = p
+                self.shift_state = self._SHIFT_POST_HOLD
+                self.shift_t_phase = now
 
-        msg.pedal_cmd = float(cmd)
-        _set_if_has(msg, 'pedal_cmd_type', int(self.brake_cmd_type))
-        if hasattr(msg, 'count'):
-            msg.count = self._bump()
-        return msg
- 
+        if self.shift_state == self._SHIFT_POST_HOLD:
+            if (now - self.shift_t_phase) * 1000.0 >= float(self.gear_post_shift_hold_ms):
+                self.get_logger().info("Shift complete (post-hold done).")
+                self._shift_abort()
+
+    # -------- main loop --------
+    def _on_timer(self) -> None:
+        now = time.time()
+
+        # keep hazard shim alive for late subscribers
+        if self.last_hazard_t > 0.0 and (now - self.last_hazard_t) * 1000.0 < self.hazard_shim_timeout_ms:
+            u = UInt8()
+            u.data = int(self.last_hazard)
+            self.pub_hazard_shim.publish(u)
+
+        # Run shift FSM if active
+        if self.shift_state != self._SHIFT_IDLE:
+            self._run_shift(now)
+            return
+
+        # watchdog on control_cmd
+        if not self._control_fresh(now):
+            if self.safe_zero:
+                self.pub_thr.publish(self._build_throttle(0.0))
+                self.pub_brk.publish(self._build_brake(0.0))
+                self.pub_str.publish(self._build_steering(now, 0.0))
+                self._publish_misc_if_needed(now)
+            return
+
+        if not self._ready():
+            if self.safe_zero:
+                self.pub_thr.publish(self._build_throttle(0.0))
+                self.pub_brk.publish(self._build_brake(0.0))
+                self.pub_str.publish(self._build_steering(now, 0.0))
+                self._publish_misc_if_needed(now)
+            return
+
+        a = self.ctrl.accel_mps2
+
+        thr = 0.0
+        brk = 0.0
+        if a >= 0.0:
+            thr = _clamp(a * self.k_th, 0.0, self.max_th)
+            if thr < self.db_th:
+                thr = 0.0
+        else:
+            brk = _clamp((-a) * self.k_br, 0.0, self.max_br)
+            if brk < self.db_br:
+                brk = 0.0
+
+        self.pub_thr.publish(self._build_throttle(thr))
+        self.pub_brk.publish(self._build_brake(brk))
+        self.pub_str.publish(self._build_steering(now, self.ctrl.tire_angle_rad))
+
+        # Turn signals: only publish MiscCmd in short bursts
+        self._publish_misc_if_needed(now)
+
+    @staticmethod
+    def _map_aw_gear_to_dbw(aw_gear: int) -> int:
+        # Mapping kept consistent with your previous bridge:
+        # 22=P, (20,21)=R/N treated as R, 1=D, 2..19=LOW, 23/24=extra -> 5
+        if aw_gear == 22:
+            return 1  # PARK
+        if aw_gear in (20, 21):
+            return 2  # REVERSE (neutral treated as reverse)
+        if aw_gear == 1:
+            return 3  # DRIVE
+        if 2 <= aw_gear <= 19:
+            return 4  # LOW
+        if aw_gear in (23, 24):
+            return 5
+        return 0
 
 
-    def _mk_steer_angle(self, swa_rad: float, swa_vel: float = 3.0) -> SteeringCmd:
-        msg = SteeringCmd()
-        _set_if_has(msg, 'enable', True)
-        _set_if_has(msg, 'clear', False)
-        _set_if_has(msg, 'ignore', False)
-        msg.steering_wheel_angle_cmd = float(swa_rad)
-        _set_if_has(msg, 'steering_wheel_angle_velocity', float(max(0.0, swa_vel)))
-        _set_if_has(msg, 'cmd_type', 0)  # CMD_ANGLE
-        _set_if_has(msg, 'quiet', False)
-        _set_if_has(msg, 'alert', False)
-        if hasattr(msg, 'count'):
-            msg.count = self._bump()
-        return msg
-
-    def safe_zero(self):
-        # Keep heartbeat alive but send zero actuation
-        self.pub_throttle.publish(self._mk_throttle_percent(0.0))
-        self.pub_brake.publish(self._mk_brake_percent(0.0))
-        self.pub_steer.publish(self._mk_steer_angle(0.0, swa_vel=3.0))
-
-
-def main():
+def main() -> None:
     rclpy.init()
-    node = AutowareToDbw()
-
-    def _sigint_handler(signum, frame):
-        node._shutdown_requested = True
-    signal.signal(signal.SIGINT, _sigint_handler)
-
-    executor = SingleThreadedExecutor()
-    executor.add_node(node)
-
+    node = AutowareToDbwCan()
     try:
-        while rclpy.ok() and not node._shutdown_requested:
-            executor.spin_once(timeout_sec=0.1)
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
-        try:
-            executor.remove_node(node)
-        except Exception:
-            pass
-        try:
-            node.destroy_node()
-        except Exception:
-            pass
-        try:
-            if rclpy.ok():
-                rclpy.shutdown()
-        except Exception:
-            pass
+        node.destroy_node()
+        rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-
