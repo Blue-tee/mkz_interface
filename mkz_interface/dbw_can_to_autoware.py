@@ -51,6 +51,8 @@ class DbwCanToAutoware(Node):
 
         self.declare_parameter("steering_wheel_to_tire_ratio", 14.8)
 
+        # NOTE: Smooth longitudinal behavior is handled in autoware_to_dbw_can.py.
+
         # DBW topics
         self.declare_parameter("dbw_dbw_enabled", "/vehicle/dbw_enabled")
         self.declare_parameter("dbw_steering_report", "/vehicle/steering_report")
@@ -88,6 +90,7 @@ class DbwCanToAutoware(Node):
         self.create_subscription(UInt8, self.get_parameter("hazard_shim_topic").value, self._on_hazard_shim, qos)
 
         self.hazard_latched = 0
+        self.last_dbw_gear = 0  # latest DBW gear state (used to sign velocity in reverse)
 
         self.get_logger().info("MKZ DBW1 state bridge ready (publishing Autoware vehicle status topics).")
 
@@ -112,7 +115,13 @@ class DbwCanToAutoware(Node):
         vr = VelocityReport()
         vr.header.stamp = self.get_clock().now().to_msg()
         vr.header.frame_id = "base_link"
-        vr.longitudinal_velocity = float(msg.speed)
+        # Dataspeed SteeringReport.speed is a magnitude. Use latest gear report to sign it in reverse.
+        signed_speed = float(msg.speed)
+        if int(self.last_dbw_gear) == 2:  # 2 = REVERSE (DBW GearReport)
+            signed_speed = -abs(signed_speed)
+        else:
+            signed_speed = abs(signed_speed)
+        vr.longitudinal_velocity = signed_speed
         vr.lateral_velocity = 0.0
         vr.heading_rate = 0.0
         self.pub_vel.publish(vr)
@@ -131,6 +140,8 @@ class DbwCanToAutoware(Node):
                 dbw = int(msg.state)
             except Exception:
                 dbw = 0
+
+        self.last_dbw_gear = int(dbw)
 
         gr = AwGearReport()
         gr.stamp = self.get_clock().now().to_msg()

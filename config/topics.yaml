@@ -1,85 +1,63 @@
 /**:
   ros__parameters:
-    # Timing
     rate_hz: 50.0
-    watchdog_ms: 100
-
-    # Autoware topics (vehicle_cmd_gate outputs)
+    watchdog_ms: 600
     aw_control_cmd: /control/command/control_cmd
     aw_gear_cmd: /control/command/gear_cmd
     aw_turn_cmd: /control/command/turn_indicators_cmd
     aw_hazard_cmd: /control/command/hazard_lights_cmd
     aw_engage: /api/autoware/get/engage
-
-    # DBW topics (commands)
     dbw_throttle_cmd: /vehicle/throttle_cmd
     dbw_brake_cmd: /vehicle/brake_cmd
     dbw_steering_cmd: /vehicle/steering_cmd
     dbw_gear_cmd: /vehicle/gear_cmd
     dbw_misc_cmd: /vehicle/misc_cmd
-
-    # DBW enable/disable (THIS PLATFORM USES std_msgs/Empty)
     dbw_enable_topic: /vehicle/enable
     dbw_disable_topic: /vehicle/disable
     dbw_dbw_enabled: /vehicle/dbw_enabled
-
-    # DBW report topics (used by gear + intelligent steering)
-    dbw_steering_report: /vehicle/steering_report   # contains speed (m/s) + steering_wheel_angle (rad)
+    dbw_steering_report: /vehicle/steering_report
     dbw_gear_report: /vehicle/gear_report
     dbw_misc_report: /vehicle/misc_1_report
-
-    # Hazard shim
     hazard_shim_topic: /mkz_interface/hazard_cmd_latched
     hazard_shim_timeout_ms: 2000
-
-    # Vehicle constants
     steering_wheel_to_tire_ratio: 14.8
     max_steering_wheel_angle_deg: 470.0
-
-    # Steering sign: +1 keeps Autoware convention (positive = LEFT).
-    # Set -1 if your physical steering turns the opposite way.
     steering_sign: 1.0
-
-    # --- Intelligent steering velocity (recommended ON) ---
     steer_vel_enable: true
-    steer_vel_min: 3.0           # rad/s minimum
-    steer_vel_gain: 3.0          # rad/s per rad of wheel-angle error
-    steer_vel_tau: 0.25          # seconds low-pass on velocity
-    steer_vel_dv_max: 10.0       # rad/s^2 max dv/dt
-
-    # Speed-based caps (piecewise linear)
-    steer_vel_cap_speeds: [0.0, 2.0, 10.0, 25.0, 35.0]  # m/s
-    steer_vel_cap_vels:   [10.0, 9.0, 7.0, 5.0, 4.5]    # rad/s
-
-    # Legacy fixed steering velocity (used if steer_vel_enable=false)
+    steer_vel_min: 3.0
+    steer_vel_gain: 3.0
+    steer_vel_tau: 0.25
+    steer_vel_dv_max: 10.0
+    steer_vel_cap_speeds:
+    - 0.0
+    - 2.0
+    - 10.0
+    - 25.0
+    - 35.0
+    steer_vel_cap_vels:
+    - 10.0
+    - 9.0
+    - 7.0
+    - 5.0
+    - 4.5
     steering_wheel_angle_velocity: 3.0
-
-    # Report freshness window used by interlock + intelligent steering
     report_fresh_ms: 300
-
-    # Gating
     require_engage: true
     require_dbw_enabled: true
-    auto_enable_on_engage: false
+    auto_enable_on_engage: true
     publish_safe_zero_when_not_ready: true
-
-    # Longitudinal mapping (accel -> percent)
     accel_to_throttle_gain: 0.25
-    accel_to_brake_gain: 0.30
+    accel_to_brake_gain: 0.3
     max_throttle: 0.25
-    max_brake: 0.40
+    max_brake: 0.4
     throttle_deadband: 0.01
     brake_deadband: 0.01
-
-    # --- Interlock (brake-to-shift) ---
     gear_change_requires_brake: true
-    gear_change_brake_percent: 0.70
+    gear_change_brake_percent: 0.7
     gear_post_shift_hold_ms: 1000
-    gear_change_speed_thresh: 0.10
+    gear_change_speed_thresh: 0.1
     gear_change_timeout_ms: 3000
     gear_report_match_required: true
-
-    # Autoware status topics (published by dbw_can_to_autoware.py)
     aw_velocity_status: /vehicle/status/velocity_status
     aw_steering_status: /vehicle/status/steering_status
     aw_gear_status: /vehicle/status/gear_status
@@ -87,3 +65,36 @@
     aw_hazard_status: /vehicle/status/hazard_lights_status
     aw_control_mode_status: /vehicle/status/control_mode
     aw_steering_status_for_gate: /vehicle_cmd_gate/input/steering
+    route_state_topic: /planning/mission_planning/state
+    auto_park_enable: true
+    auto_park_speed_thresh: 0.05
+    auto_park_dwell_ms: 300
+    turn_keepalive_enable: true
+    turn_keepalive_hz: 20.0
+    turn_off_burst_ms: 300
+    drive_profile: "normal"
+
+
+
+# ---------------------------------------------------------------------------
+# Optional longitudinal tuning (MKZ "feel") parameters for autoware_to_dbw_can
+#
+# Switch profile:
+#   drive_profile: "comfort" | "normal" | "sport"
+#
+# You can override any values below to fine tune "luxury vs sporty" feel.
+# Precedence: explicit YAML value > drive_profile preset > .py default.
+# ---------------------------------------------------------------------------
+# mkz_interface:
+#   ros__parameters:
+#     drive_profile: "normal"
+#     lon_shaping_enable: true
+#     accel_filter_tau: 0.18
+#     accel_coast_band: 0.12
+#     thr_slew_per_s: 0.85
+#     brk_slew_per_s: 1.20
+#     stop_hold_enable: true
+#     stop_hold_speed_mps: 0.18
+#     stop_hold_accel_band: 0.18
+#     stop_hold_brake: 0.04
+# ---------------------------------------------------------------------------

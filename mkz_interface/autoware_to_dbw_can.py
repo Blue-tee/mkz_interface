@@ -3,24 +3,21 @@
 autoware_to_dbw_can.py
 Bridge: Autoware vehicle_cmd_gate outputs -> Dataspeed DBW1 commands (Lincoln MKZ 2018, DBW1)
 
-Key behaviors:
+Behaviors kept from your existing bridge:
 - /vehicle/enable and /vehicle/disable are std_msgs/Empty
 - Throttle/Brake published as CMD_PERCENT
 - Steering: Autoware steering_tire_angle (rad) -> DBW steering_wheel_angle_cmd (rad) via ratio
 - Hazards accepted but NOT actuated (publish a shim latch only)
-- Turn signals: burst-mode (avoid continuous spamming)
+- Turn signals:
+    * DBW expects periodic refresh (keepalive). We hold LEFT/RIGHT and publish at turn_keepalive_hz.
+    * When OFF is requested, publish 0 for turn_off_burst_ms then stop.
 
-Gear change interlock (optional):
+Gear change interlock:
 - Apply fixed brake %, wait for near-zero speed, send gear cmd, hold brake post-shift.
 - Uses /vehicle/steering_report speed (m/s) and /vehicle/gear_report for confirmation.
 
-NEW (Intelligent steering velocity, safe):
-- Uses DBW SteeringReport.steering_wheel_angle (rad) + speed (m/s).
-- Computes steering_wheel_angle_velocity as a function of:
-    (a) wheel-angle error (target - measured)
-    (b) vehicle speed (caps reduce at higher speeds)
-- Adds smoothing + dv/dt limiting so it won’t chatter or spike.
-- Can be toggled with steer_vel_enable.
+Auto-park:
+- When /planning/mission_planning/state == ARRIVED and vehicle speed ~0 for a dwell window, shift to PARK.
 """
 
 from __future__ import annotations
@@ -30,12 +27,7 @@ from dataclasses import dataclass
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import (
-    QoSProfile,
-    QoSHistoryPolicy,
-    QoSReliabilityPolicy,
-    QoSDurabilityPolicy,
-)
+from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
 
 from std_msgs.msg import Bool, Empty, UInt8
 
@@ -44,6 +36,8 @@ from autoware_vehicle_msgs.msg import Engage as AwEngage
 from autoware_vehicle_msgs.msg import GearCommand as AwGearCommand
 from autoware_vehicle_msgs.msg import TurnIndicatorsCommand as AwTurnCmd
 from autoware_vehicle_msgs.msg import HazardLightsCommand as AwHazCmd
+
+from autoware_planning_msgs.msg import RouteState
 
 from dbw_ford_msgs.msg import (
     ThrottleCmd,
@@ -72,7 +66,7 @@ class _LastControl:
 
 
 class AutowareToDbwCan(Node):
-    # Shift state
+    # Shift FSM
     _SHIFT_IDLE = 0
     _SHIFT_PRE_BRAKE = 1
     _SHIFT_SENT_CMD = 2
@@ -131,8 +125,6 @@ class AutowareToDbwCan(Node):
         # Vehicle constants
         self.declare_parameter("steering_wheel_to_tire_ratio", 14.8)
         self.declare_parameter("max_steering_wheel_angle_deg", 470.0)
-
-        # Steering sign (+1 keeps Autoware convention, -1 flips)
         self.declare_parameter("steering_sign", 1.0)
 
         # Legacy fixed steering velocity (used if steer_vel_enable=false)
@@ -146,7 +138,7 @@ class AutowareToDbwCan(Node):
         self.declare_parameter("steer_vel_dv_max", 10.0)      # rad/s^2 max change rate of velocity
         self.declare_parameter("steer_vel_cap_speeds", [0.0, 2.0, 10.0, 25.0, 35.0])  # m/s
         self.declare_parameter("steer_vel_cap_vels",   [10.0, 9.0,  7.0,  5.0,  4.5]) # rad/s
-        self.declare_parameter("report_fresh_ms", 300)  # shared freshness for reports (speed/steer/gear)
+        self.declare_parameter("report_fresh_ms", 300)
 
         # Longitudinal mapping (accel -> percent)
         self.declare_parameter("accel_to_throttle_gain", 0.25)
@@ -156,6 +148,42 @@ class AutowareToDbwCan(Node):
         self.declare_parameter("throttle_deadband", 0.01)
         self.declare_parameter("brake_deadband", 0.01)
 
+        # ---------------------------------------------------------------------
+        # Longitudinal "feel" shaping (Comfort/Normal/Sport) — reduces jerk while
+        # keeping the MKZ responsive.
+        #
+        # Autoware provides desired longitudinal *acceleration* (m/s^2). This
+        # bridge converts it into throttle/brake percentages. Direct mapping can
+        # feel jerky on a real vehicle due to lag + accel sign changes near 0.
+        #
+        # Key knobs:
+        #  - accel_filter_tau: low-pass filter on accel command (smooths chatter)
+        #  - accel_coast_band: "coast" zone around 0 accel (prevents thr/brk flip)
+        #  - thr/brk_slew_per_s: rate limits on actuator commands (jerk limiting)
+        #  - stop_hold_*: gentle brake hold near stop to prevent creep/oscillation
+        #
+        # Switch profiles via drive_profile:
+        #   comfort  -> smoothest
+        #   normal   -> smooth + responsive (recommended)
+        #   sport    -> more responsive, still not jerky
+        # ---------------------------------------------------------------------
+        self.declare_parameter("drive_profile", "normal")   # comfort|normal|sport
+        self.declare_parameter("lon_shaping_enable", True)
+
+        # Filtering / coast band
+        self.declare_parameter("accel_filter_tau", 0.18)    # seconds (smaller=snappier)
+        self.declare_parameter("accel_coast_band", 0.12)    # m/s^2 (bigger=less hunting)
+
+        # Slew-rate limits (units: fraction-per-second of 0..1 command)
+        self.declare_parameter("thr_slew_per_s", 0.85)      # throttle rate limit
+        self.declare_parameter("brk_slew_per_s", 1.20)      # brake rate limit
+
+        # Stop-hold (prevents creep + accel/brake oscillation near goal)
+        self.declare_parameter("stop_hold_enable", True)
+        self.declare_parameter("stop_hold_speed_mps", 0.18)     # below this, considered stopped
+        self.declare_parameter("stop_hold_accel_band", 0.18)    # if |a| small, allow hold
+        self.declare_parameter("stop_hold_brake", 0.04)         # 4% brake hold
+
         # Gear interlock (brake-to-shift)
         self.declare_parameter("gear_change_requires_brake", True)
         self.declare_parameter("gear_change_brake_percent", 0.70)
@@ -163,6 +191,17 @@ class AutowareToDbwCan(Node):
         self.declare_parameter("gear_change_speed_thresh", 0.10)     # m/s
         self.declare_parameter("gear_change_timeout_ms", 1500)
         self.declare_parameter("gear_report_match_required", True)
+
+        # Auto-park on ARRIVED + zero speed
+        self.declare_parameter("route_state_topic", "/planning/mission_planning/state")  # autoware_planning_msgs/msg/RouteState
+        self.declare_parameter("auto_park_enable", True)
+        self.declare_parameter("auto_park_speed_thresh", 0.05)     # m/s
+        self.declare_parameter("auto_park_dwell_ms", 500)          # ms
+
+        # Turn keepalive (DBW expects periodic refresh)
+        self.declare_parameter("turn_keepalive_enable", True)
+        self.declare_parameter("turn_keepalive_hz", 10.0)          # Hz while turn is requested
+        self.declare_parameter("turn_off_burst_ms", 300)           # ms
 
         # ---- pull params ----
         self.rate_hz = float(self.get_parameter("rate_hz").value)
@@ -197,12 +236,36 @@ class AutowareToDbwCan(Node):
         self.db_th = float(self.get_parameter("throttle_deadband").value)
         self.db_br = float(self.get_parameter("brake_deadband").value)
 
+        # Longitudinal shaping params
+        self.drive_profile = str(self.get_parameter("drive_profile").value).strip().lower()
+        self.lon_shaping_enable = bool(self.get_parameter("lon_shaping_enable").value)
+
+        self.a_tau = float(self.get_parameter("accel_filter_tau").value)
+        self.a_coast = float(self.get_parameter("accel_coast_band").value)
+
+        self.thr_slew = float(self.get_parameter("thr_slew_per_s").value)
+        self.brk_slew = float(self.get_parameter("brk_slew_per_s").value)
+
+        self.stop_hold_enable = bool(self.get_parameter("stop_hold_enable").value)
+        self.stop_hold_speed = float(self.get_parameter("stop_hold_speed_mps").value)
+        self.stop_hold_accel_band = float(self.get_parameter("stop_hold_accel_band").value)
+        self.stop_hold_brake = float(self.get_parameter("stop_hold_brake").value)
+
         self.gear_change_requires_brake = bool(self.get_parameter("gear_change_requires_brake").value)
         self.gear_change_brake_percent = float(self.get_parameter("gear_change_brake_percent").value)
         self.gear_post_shift_hold_ms = int(self.get_parameter("gear_post_shift_hold_ms").value)
         self.gear_change_speed_thresh = float(self.get_parameter("gear_change_speed_thresh").value)
         self.gear_change_timeout_ms = int(self.get_parameter("gear_change_timeout_ms").value)
         self.gear_report_match_required = bool(self.get_parameter("gear_report_match_required").value)
+
+        self.route_state_topic = str(self.get_parameter("route_state_topic").value)
+        self.auto_park_enable = bool(self.get_parameter("auto_park_enable").value)
+        self.auto_park_speed_thresh = float(self.get_parameter("auto_park_speed_thresh").value)
+        self.auto_park_dwell_ms = int(self.get_parameter("auto_park_dwell_ms").value)
+
+        self.turn_keepalive_enable = bool(self.get_parameter("turn_keepalive_enable").value)
+        self.turn_keepalive_hz = float(self.get_parameter("turn_keepalive_hz").value)
+        self.turn_off_burst_ms = int(self.get_parameter("turn_off_burst_ms").value)
 
         # Sanity: cap arrays must match
         if len(self.steer_vel_cap_speeds) != len(self.steer_vel_cap_vels) or len(self.steer_vel_cap_speeds) < 2:
@@ -232,6 +295,7 @@ class AutowareToDbwCan(Node):
 
         self.create_subscription(DbwSteeringReport, self.get_parameter("dbw_steering_report").value, self._on_steering_report, qos)
         self.create_subscription(DbwGearReport, self.get_parameter("dbw_gear_report").value, self._on_gear_report, qos)
+        self.create_subscription(RouteState, self.route_state_topic, self._on_route_state, qos)
 
         # ---- state ----
         self.engaged = False
@@ -244,11 +308,21 @@ class AutowareToDbwCan(Node):
         self.last_hazard = 0
         self.last_hazard_t = 0.0
 
-        # Turn policy: publish MiscCmd only in short bursts
-        self._aw_turn_cmd = 1
-        self._hazards_continuous = False  # hazards not actuated
-        self._turn_burst_until = None
-        self._turn_value = 0  # 0 none, 1 left, 2 right
+        # Turn state
+        self._aw_turn_cmd = 1  # default DISABLE
+        self._turn_hold_value = 0           # 0 none, 1 left, 2 right
+        self._turn_off_until_t = 0.0
+        self._turn_last_pub_t = 0.0
+
+        # Longitudinal shaping internal state (filter + slew limiter)
+        self._a_filt = 0.0       # filtered accel command (m/s^2)
+        self._thr_cmd = 0.0      # current throttle command (0..1)
+        self._brk_cmd = 0.0      # current brake command (0..1)
+        self._lon_t = time.time()
+
+        # Apply comfort/normal/sport profile presets (starting point).
+        # You can override any value in YAML (no code changes needed).
+        self._apply_drive_profile()
 
         # DBW report caches
         self.last_speed_mps = 0.0
@@ -257,6 +331,12 @@ class AutowareToDbwCan(Node):
         self.last_wheel_angle_t = 0.0
         self.last_dbw_gear = 0
         self.last_dbw_gear_t = 0.0
+
+        # Route / auto-park state
+        self.last_route_state = int(RouteState.UNKNOWN)
+        self.last_route_state_t = 0.0
+        self._auto_park_seen_zero_t = 0.0
+        self._auto_park_latched = False
 
         # Intelligent steer velocity internal state
         self._steer_vel_cmd = float(_clamp(self.swa_vel_fixed, 0.0, 17.5))
@@ -272,9 +352,10 @@ class AutowareToDbwCan(Node):
         self.timer = self.create_timer(1.0 / max(1.0, self.rate_hz), self._on_timer)
 
         self.get_logger().info(
-            "MKZ cmd bridge ready. Throttle/Brake CMD_PERCENT. Turn signals burst-mode. "
+            "MKZ cmd bridge ready. Throttle/Brake CMD_PERCENT. "
             f"Gear interlock: {'ON' if self.gear_change_requires_brake else 'OFF'}. "
-            f"Intelligent steer vel: {'ON' if self.steer_vel_enable else 'OFF'}."
+            f"Auto-park: {'ON' if self.auto_park_enable else 'OFF'}. "
+            f"Turn keepalive: {'ON' if self.turn_keepalive_enable else 'OFF'}."
         )
 
     # -------- small utils --------
@@ -300,6 +381,83 @@ class AutowareToDbwCan(Node):
         if t_wall <= 0.0:
             return False
         return (time.time() - t_wall) * 1000.0 <= float(self.report_fresh_ms)
+
+
+
+
+    def _param_was_overridden(self, name: str) -> bool:
+        """True if parameter was explicitly set via YAML/CLI overrides.
+
+        Precedence:
+          explicit YAML/CLI value  >  drive_profile preset  >  .py default
+        """
+        try:
+            return name in getattr(self, "_parameter_overrides", {})
+        except Exception:
+            return False
+
+    def _apply_drive_profile(self) -> None:
+        """Apply comfort/normal/sport presets for longitudinal shaping.
+
+        IMPORTANT: explicit YAML/CLI parameters should override the profile.
+        Precedence:
+          explicit YAML/CLI value  >  drive_profile preset  >  .py default
+        """
+        p = str(getattr(self, "drive_profile", "normal")).strip().lower()
+
+        if p == "comfort":
+            preset = dict(
+                accel_filter_tau=0.28,
+                accel_coast_band=0.16,
+                thr_slew_per_s=0.65,
+                brk_slew_per_s=0.95,
+                stop_hold_speed_mps=0.22,
+                stop_hold_accel_band=0.22,
+                stop_hold_brake=0.05,
+            )
+        elif p == "sport":
+            preset = dict(
+                accel_filter_tau=0.12,
+                accel_coast_band=0.09,
+                thr_slew_per_s=1.20,
+                brk_slew_per_s=1.60,
+                stop_hold_speed_mps=0.16,
+                stop_hold_accel_band=0.16,
+                stop_hold_brake=0.035,
+            )
+        else:
+            preset = dict(
+                accel_filter_tau=0.18,
+                accel_coast_band=0.12,
+                thr_slew_per_s=0.85,
+                brk_slew_per_s=1.20,
+                stop_hold_speed_mps=0.18,
+                stop_hold_accel_band=0.18,
+                stop_hold_brake=0.04,
+            )
+
+        # Apply preset only if user did NOT override that param in YAML/CLI
+        if not self._param_was_overridden("accel_filter_tau"):
+            self.a_tau = float(preset["accel_filter_tau"])
+        if not self._param_was_overridden("accel_coast_band"):
+            self.a_coast = float(preset["accel_coast_band"])
+        if not self._param_was_overridden("thr_slew_per_s"):
+            self.thr_slew = float(preset["thr_slew_per_s"])
+        if not self._param_was_overridden("brk_slew_per_s"):
+            self.brk_slew = float(preset["brk_slew_per_s"])
+        if not self._param_was_overridden("stop_hold_speed_mps"):
+            self.stop_hold_speed = float(preset["stop_hold_speed_mps"])
+        if not self._param_was_overridden("stop_hold_accel_band"):
+            self.stop_hold_accel_band = float(preset["stop_hold_accel_band"])
+        if not self._param_was_overridden("stop_hold_brake"):
+            self.stop_hold_brake = float(preset["stop_hold_brake"])
+
+        self.get_logger().info(
+            f"Drive profile={p}. lon_shaping_enable={self.lon_shaping_enable}. "
+            f"tau={self.a_tau:.3f}s coast={self.a_coast:.3f} "
+            f"thr_slew={self.thr_slew:.2f}/s brk_slew={self.brk_slew:.2f}/s "
+            f"stop_hold={self.stop_hold_enable} (v<{self.stop_hold_speed:.2f} m/s, brk={self.stop_hold_brake:.3f})."
+        )
 
     # -------- callbacks --------
     def _on_engage(self, msg: AwEngage) -> None:
@@ -333,13 +491,7 @@ class AutowareToDbwCan(Node):
         u.data = int(self.last_hazard)
         self.pub_hazard_shim.publish(u)
 
-        # Ensure hazard does NOT affect turn behavior
-        self._hazards_continuous = False
-
     def _on_steering_report(self, msg: DbwSteeringReport) -> None:
-        # DBW SteeringReport has:
-        # - steering_wheel_angle (rad)
-        # - speed (m/s)
         try:
             self.last_speed_mps = float(msg.speed)
         except Exception:
@@ -349,7 +501,6 @@ class AutowareToDbwCan(Node):
         try:
             self.last_wheel_angle_rad = float(msg.steering_wheel_angle)
         except Exception:
-            # keep previous
             pass
         self.last_wheel_angle_t = time.time()
 
@@ -364,6 +515,17 @@ class AutowareToDbwCan(Node):
                 g = 0
         self.last_dbw_gear = g
         self.last_dbw_gear_t = time.time()
+
+    def _on_route_state(self, msg: RouteState) -> None:
+        try:
+            self.last_route_state = int(msg.state)
+        except Exception:
+            self.last_route_state = int(RouteState.UNKNOWN)
+        self.last_route_state_t = time.time()
+
+        if self.last_route_state != int(RouteState.ARRIVED):
+            self._auto_park_latched = False
+            self._auto_park_seen_zero_t = 0.0
 
     def _on_gear_cmd(self, msg: AwGearCommand) -> None:
         desired_dbw = int(self._map_aw_gear_to_dbw(int(msg.command)))
@@ -401,33 +563,39 @@ class AutowareToDbwCan(Node):
         self.shift_cmd_sent = False
         self.get_logger().info(f"Starting brake-to-shift: target_dbw_gear={desired_dbw}")
 
-    # -------- turn burst helpers --------
+    # -------- turn keepalive helpers --------
     def _recalc_turn_policy(self) -> None:
-        # Your working values: 1=DISABLE, 2=LEFT, 3=RIGHT (0 may be NO_COMMAND)
         now = time.time()
-        self._hazards_continuous = False
-
-        c = int(self._aw_turn_cmd)
-        if c == 2:
-            self._turn_value = 1  # LEFT
-            self._turn_burst_until = now + 0.5
-        elif c == 3:
-            self._turn_value = 2  # RIGHT
-            self._turn_burst_until = now + 0.5
+        cmd = int(getattr(self, "_aw_turn_cmd", 0))
+        # Autoware TurnIndicatorsCommand: 0 NO_COMMAND, 1 DISABLE, 2 LEFT, 3 RIGHT
+        if cmd == 2:
+            self._turn_hold_value = 1
+            self._turn_off_until_t = 0.0
+        elif cmd == 3:
+            self._turn_hold_value = 2
+            self._turn_off_until_t = 0.0
         else:
-            self._turn_value = 0  # OFF
-            self._turn_burst_until = now + 0.2
+            self._turn_hold_value = 0
+            self._turn_off_until_t = now + (float(self.turn_off_burst_ms) / 1000.0)
+
+        self._turn_last_pub_t = 0.0  # publish immediately
 
     def _publish_misc_if_needed(self, now: float) -> None:
-        send_value = None
-        if self._hazards_continuous:
-            send_value = 3  # HAZARD (not used)
-        elif self._turn_burst_until is not None and now < float(self._turn_burst_until):
-            send_value = int(self._turn_value)
-        else:
-            self._turn_burst_until = None
+        if not self.turn_keepalive_enable:
+            return
 
-        if send_value is None:
+        hz = float(self.turn_keepalive_hz)
+        if hz <= 0.0:
+            return
+        period = 1.0 / hz
+        if self._turn_last_pub_t > 0.0 and (now - self._turn_last_pub_t) < period:
+            return
+
+        if int(self._turn_hold_value) != 0:
+            send_value = int(self._turn_hold_value)
+        elif now <= float(self._turn_off_until_t):
+            send_value = 0
+        else:
             return
 
         m = MiscCmd()
@@ -435,10 +603,10 @@ class AutowareToDbwCan(Node):
         m.cmd.value = int(send_value)  # 0 NONE, 1 LEFT, 2 RIGHT
         m.pbrk.cmd = 0
         self.pub_misc.publish(m)
+        self._turn_last_pub_t = now
 
     # -------- intelligent steering velocity helpers --------
     def _interp_cap(self, speed_mps: float) -> float:
-        # Piecewise-linear interpolation over (cap_speeds, cap_vels)
         s = float(speed_mps)
         xs = self.steer_vel_cap_speeds
         ys = self.steer_vel_cap_vels
@@ -462,39 +630,30 @@ class AutowareToDbwCan(Node):
         return float(ys[-1])
 
     def _compute_steer_velocity(self, now: float, target_wheel_angle: float) -> float:
-        # Fallback to fixed velocity if disabled
         if not self.steer_vel_enable:
             return float(_clamp(self.swa_vel_fixed, 0.0, 17.5))
 
-        # Use measured wheel angle if fresh, else fall back to last commanded target
+        wheel_cur = float(target_wheel_angle)
         if self._report_fresh(self.last_wheel_angle_t):
             wheel_cur = float(self.last_wheel_angle_rad)
-        else:
-            # If we don't have fresh feedback, be conservative: assume we are at previous target.
-            wheel_cur = float(target_wheel_angle)
 
-        # Speed (fresh -> use; else conservative mid-speed cap)
+        spd = 10.0
         if self._report_fresh(self.last_speed_t):
             spd = float(abs(self.last_speed_mps))
-        else:
-            spd = 10.0  # conservative assumption
 
         cap = float(_clamp(self._interp_cap(spd), 0.0, 17.5))
-
         err = abs(float(target_wheel_angle) - float(wheel_cur))
+
         v_req = float(self.steer_vel_min + self.steer_vel_gain * err)
         v_req = float(_clamp(v_req, self.steer_vel_min, cap))
 
-        # Smooth + dv/dt limit
         dt = max(1e-3, float(now - self._steer_vel_t))
         self._steer_vel_t = float(now)
 
-        # First-order low-pass on velocity command
         tau = max(1e-3, float(self.steer_vel_tau))
         alpha = dt / (tau + dt)
         v_filt = float(self._steer_vel_cmd + alpha * (v_req - self._steer_vel_cmd))
 
-        # dv/dt limiting
         dv_max = max(0.0, float(self.steer_vel_dv_max)) * dt
         v_limited = float(_clamp(v_filt, self._steer_vel_cmd - dv_max, self._steer_vel_cmd + dv_max))
 
@@ -525,7 +684,6 @@ class AutowareToDbwCan(Node):
         return m
 
     def _build_steering(self, now: float, tire_angle_rad: float) -> SteeringCmd:
-        # Autoware convention: positive tire_angle is LEFT (in FLU). steering_sign allows flipping if needed.
         wheel_target = float(self.steering_sign) * float(tire_angle_rad) * float(self.ratio)
         wheel_target = float(_clamp(wheel_target, -self.max_swa_rad, self.max_swa_rad))
 
@@ -573,11 +731,9 @@ class AutowareToDbwCan(Node):
         self.pub_thr.publish(self._build_throttle(0.0))
         self.pub_brk.publish(self._build_brake(brk))
 
-        # Keep steering based on last control if fresh
         tire = self.ctrl.tire_angle_rad if self._control_fresh(now) else 0.0
         self.pub_str.publish(self._build_steering(now, tire))
 
-        # Turn signals: burst-only
         self._publish_misc_if_needed(now)
 
         speed_ok = False
@@ -623,6 +779,34 @@ class AutowareToDbwCan(Node):
             u.data = int(self.last_hazard)
             self.pub_hazard_shim.publish(u)
 
+        # Auto-park: ARRIVED + zero speed dwell -> shift to PARK (DBW gear=1)
+        if self.auto_park_enable:
+            arrived = (self.last_route_state == int(RouteState.ARRIVED))
+            speed_fresh = self._report_fresh(self.last_speed_t)
+            speed_zero = speed_fresh and (abs(self.last_speed_mps) <= float(self.auto_park_speed_thresh))
+
+            if not arrived:
+                self._auto_park_seen_zero_t = 0.0
+            else:
+                if speed_zero:
+                    if self._auto_park_seen_zero_t <= 0.0:
+                        self._auto_park_seen_zero_t = now
+                else:
+                    self._auto_park_seen_zero_t = 0.0
+
+            already_in_park = self._report_fresh(self.last_dbw_gear_t) and (int(self.last_dbw_gear) == 1)
+
+            if arrived and (not self._auto_park_latched) and (not already_in_park) and (self.shift_state == self._SHIFT_IDLE):
+                dwell_ok = self._auto_park_seen_zero_t > 0.0 and (now - self._auto_park_seen_zero_t) * 1000.0 >= float(self.auto_park_dwell_ms)
+                if dwell_ok and self._ready():
+                    self.shift_target_dbw_gear = 1  # PARK
+                    self.shift_t0 = now
+                    self.shift_t_phase = now
+                    self.shift_state = self._SHIFT_PRE_BRAKE
+                    self.shift_cmd_sent = False
+                    self._auto_park_latched = True
+                    self.get_logger().info("Auto-park: ARRIVED + zero speed dwell satisfied -> shifting to PARK.")
+
         # Run shift FSM if active
         if self.shift_state != self._SHIFT_IDLE:
             self._run_shift(now)
@@ -645,34 +829,89 @@ class AutowareToDbwCan(Node):
                 self._publish_misc_if_needed(now)
             return
 
-        a = self.ctrl.accel_mps2
+        a_raw = float(self.ctrl.accel_mps2)
 
-        thr = 0.0
-        brk = 0.0
-        if a >= 0.0:
-            thr = _clamp(a * self.k_th, 0.0, self.max_th)
-            if thr < self.db_th:
-                thr = 0.0
+        # -----------------------------------------------------------------
+        # Longitudinal command shaping (smooth but responsive)
+        # -----------------------------------------------------------------
+        if not self.lon_shaping_enable:
+            # Legacy behavior: direct accel->percent mapping (most responsive, can be jerky)
+            thr = 0.0
+            brk = 0.0
+            if a_raw >= 0.0:
+                thr = _clamp(a_raw * self.k_th, 0.0, self.max_th)
+                if thr < self.db_th:
+                    thr = 0.0
+            else:
+                brk = _clamp((-a_raw) * self.k_br, 0.0, self.max_br)
+                if brk < self.db_br:
+                    brk = 0.0
+
+            self.pub_thr.publish(self._build_throttle(thr))
+            self.pub_brk.publish(self._build_brake(brk))
         else:
-            brk = _clamp((-a) * self.k_br, 0.0, self.max_br)
-            if brk < self.db_br:
-                brk = 0.0
+            # 1) Low-pass filter the acceleration command to remove chatter
+            dt = max(1e-3, float(now - self._lon_t))
+            self._lon_t = float(now)
 
-        self.pub_thr.publish(self._build_throttle(thr))
-        self.pub_brk.publish(self._build_brake(brk))
+            tau = max(1e-3, float(self.a_tau))
+            alpha = dt / (tau + dt)
+            self._a_filt = float(self._a_filt + alpha * (a_raw - self._a_filt))
+            a = float(self._a_filt)
+
+            # 2) Convert accel->percent with a "coast band" around 0 accel.
+            #    Prevents throttle/brake flipping near zero (speed hunting).
+            thr_tgt = 0.0
+            brk_tgt = 0.0
+
+            if abs(a) < float(self.a_coast):
+                thr_tgt = 0.0
+                brk_tgt = 0.0
+            elif a > 0.0:
+                thr_tgt = _clamp(a * self.k_th, 0.0, self.max_th)
+                if thr_tgt < self.db_th:
+                    thr_tgt = 0.0
+            else:
+                brk_tgt = _clamp((-a) * self.k_br, 0.0, self.max_br)
+                if brk_tgt < self.db_br:
+                    brk_tgt = 0.0
+
+            # 3) Stop-hold: prevents creep and oscillation near a full stop.
+            if self.stop_hold_enable and self._report_fresh(self.last_speed_t):
+                speed_mps = float(abs(self.last_speed_mps))
+                if speed_mps < float(self.stop_hold_speed) and abs(a) < float(self.stop_hold_accel_band):
+                    thr_tgt = 0.0
+                    brk_tgt = max(float(brk_tgt), float(self.stop_hold_brake))
+
+            # 4) Slew-rate limit throttle and brake commands (jerk limiting).
+            thr_step = max(0.0, float(self.thr_slew)) * dt
+            brk_step = max(0.0, float(self.brk_slew)) * dt
+
+            self._thr_cmd = float(_clamp(thr_tgt, self._thr_cmd - thr_step, self._thr_cmd + thr_step))
+            self._brk_cmd = float(_clamp(brk_tgt, self._brk_cmd - brk_step, self._brk_cmd + brk_step))
+
+            # Ensure mutual exclusion (never command both at once).
+            if self._thr_cmd > 0.0 and self._brk_cmd > 0.0:
+                if self._thr_cmd >= self._brk_cmd:
+                    self._brk_cmd = 0.0
+                else:
+                    self._thr_cmd = 0.0
+
+            self.pub_thr.publish(self._build_throttle(self._thr_cmd))
+            self.pub_brk.publish(self._build_brake(self._brk_cmd))
+
+        # Steering / misc unchanged
         self.pub_str.publish(self._build_steering(now, self.ctrl.tire_angle_rad))
-
-        # Turn signals: only publish MiscCmd in short bursts
         self._publish_misc_if_needed(now)
 
     @staticmethod
     def _map_aw_gear_to_dbw(aw_gear: int) -> int:
-        # Mapping kept consistent with your previous bridge:
+        # Mapping consistent with your previous bridge:
         # 22=P, (20,21)=R/N treated as R, 1=D, 2..19=LOW, 23/24=extra -> 5
         if aw_gear == 22:
             return 1  # PARK
         if aw_gear in (20, 21):
-            return 2  # REVERSE (neutral treated as reverse)
+            return 2  # REVERSE
         if aw_gear == 1:
             return 3  # DRIVE
         if 2 <= aw_gear <= 19:
