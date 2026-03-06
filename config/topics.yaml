@@ -72,7 +72,7 @@
     turn_keepalive_enable: true
     turn_keepalive_hz: 20.0
     turn_off_burst_ms: 300
-    drive_profile: "normal"
+    drive_profile: "comfort"
 
 
 
