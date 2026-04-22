@@ -1,6 +1,6 @@
 /**:
   ros__parameters:
-    rate_hz: 50.0
+    rate_hz: 100.0
     watchdog_ms: 600
     aw_control_cmd: /control/command/control_cmd
     aw_gear_cmd: /control/command/gear_cmd
@@ -43,12 +43,11 @@
     steering_wheel_angle_velocity: 3.0
     report_fresh_ms: 300
     require_engage: true
-    require_dbw_enabled: true
     auto_enable_on_engage: true
     publish_safe_zero_when_not_ready: true
-    accel_to_throttle_gain: 0.25
-    accel_to_brake_gain: 0.3
-    max_throttle: 0.25
+    accel_to_throttle_gain: 0.24
+    accel_to_brake_gain: 0.18
+    max_throttle: 0.35
     max_brake: 0.4
     throttle_deadband: 0.01
     brake_deadband: 0.01
@@ -67,12 +66,17 @@
     aw_steering_status_for_gate: /vehicle_cmd_gate/input/steering
     route_state_topic: /planning/mission_planning/state
     auto_park_enable: true
-    auto_park_speed_thresh: 0.05
-    auto_park_dwell_ms: 300
+    auto_park_speed_thresh: 0.00
+    auto_park_dwell_ms: 1000
+    arrived_hold_brake_enable: true
+    arrived_hold_brake_percent: 0.10
+    auto_disable_after_park: true
+    post_park_disable_ms: 1000
     turn_keepalive_enable: true
     turn_keepalive_hz: 20.0
     turn_off_burst_ms: 300
     drive_profile: "comfort"
+    lon_shaping_enable: false
 
 
 

@@ -28,6 +28,7 @@ from dataclasses import dataclass
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSHistoryPolicy, QoSReliabilityPolicy, QoSDurabilityPolicy
+from rcl_interfaces.msg import SetParametersResult
 
 from std_msgs.msg import Bool, Empty, UInt8
 
@@ -86,7 +87,7 @@ class AutowareToDbwCan(Node):
         qos_gate.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
 
         # ---- parameters ----
-        self.declare_parameter("rate_hz", 50.0)
+        self.declare_parameter("rate_hz", 100.0)
         self.declare_parameter("watchdog_ms", 100)
 
         # Autoware topics
@@ -197,6 +198,10 @@ class AutowareToDbwCan(Node):
         self.declare_parameter("auto_park_enable", True)
         self.declare_parameter("auto_park_speed_thresh", 0.05)     # m/s
         self.declare_parameter("auto_park_dwell_ms", 500)          # ms
+        self.declare_parameter("arrived_hold_brake_enable", True)
+        self.declare_parameter("arrived_hold_brake_percent", 0.10)
+        self.declare_parameter("auto_disable_after_park", True)
+        self.declare_parameter("post_park_disable_ms", 1000)
 
         # Turn keepalive (DBW expects periodic refresh)
         self.declare_parameter("turn_keepalive_enable", True)
@@ -262,10 +267,16 @@ class AutowareToDbwCan(Node):
         self.auto_park_enable = bool(self.get_parameter("auto_park_enable").value)
         self.auto_park_speed_thresh = float(self.get_parameter("auto_park_speed_thresh").value)
         self.auto_park_dwell_ms = int(self.get_parameter("auto_park_dwell_ms").value)
+        self.arrived_hold_brake_enable = bool(self.get_parameter("arrived_hold_brake_enable").value)
+        self.arrived_hold_brake_percent = float(self.get_parameter("arrived_hold_brake_percent").value)
+        self.auto_disable_after_park = bool(self.get_parameter("auto_disable_after_park").value)
+        self.post_park_disable_ms = int(self.get_parameter("post_park_disable_ms").value)
 
         self.turn_keepalive_enable = bool(self.get_parameter("turn_keepalive_enable").value)
         self.turn_keepalive_hz = float(self.get_parameter("turn_keepalive_hz").value)
         self.turn_off_burst_ms = int(self.get_parameter("turn_off_burst_ms").value)
+
+        self.add_on_set_parameters_callback(self._on_set_parameters)
 
         # Sanity: cap arrays must match
         if len(self.steer_vel_cap_speeds) != len(self.steer_vel_cap_vels) or len(self.steer_vel_cap_speeds) < 2:
@@ -337,6 +348,8 @@ class AutowareToDbwCan(Node):
         self.last_route_state_t = 0.0
         self._auto_park_seen_zero_t = 0.0
         self._auto_park_latched = False
+        self._post_park_disable_pending = False
+        self._post_park_disable_at = 0.0
 
         # Intelligent steer velocity internal state
         self._steer_vel_cmd = float(_clamp(self.swa_vel_fixed, 0.0, 17.5))
@@ -355,6 +368,8 @@ class AutowareToDbwCan(Node):
             "MKZ cmd bridge ready. Throttle/Brake CMD_PERCENT. "
             f"Gear interlock: {'ON' if self.gear_change_requires_brake else 'OFF'}. "
             f"Auto-park: {'ON' if self.auto_park_enable else 'OFF'}. "
+            f"ARRIVED hold: {'ON' if self.arrived_hold_brake_enable else 'OFF'} ({self.arrived_hold_brake_percent:.2f}). "
+            f"Post-PARK disable: {'ON' if self.auto_disable_after_park else 'OFF'} ({self.post_park_disable_ms} ms). "
             f"Turn keepalive: {'ON' if self.turn_keepalive_enable else 'OFF'}."
         )
 
@@ -381,9 +396,6 @@ class AutowareToDbwCan(Node):
         if t_wall <= 0.0:
             return False
         return (time.time() - t_wall) * 1000.0 <= float(self.report_fresh_ms)
-
-
-
 
     def _param_was_overridden(self, name: str) -> bool:
         """True if parameter was explicitly set via YAML/CLI overrides.
@@ -459,6 +471,51 @@ class AutowareToDbwCan(Node):
             f"stop_hold={self.stop_hold_enable} (v<{self.stop_hold_speed:.2f} m/s, brk={self.stop_hold_brake:.3f})."
         )
 
+    def _arrived_hold_active(self) -> bool:
+        return bool(
+            self.arrived_hold_brake_enable
+            and self.last_route_state == int(RouteState.ARRIVED)
+            and self.shift_state == self._SHIFT_IDLE
+            and not (self._report_fresh(self.last_dbw_gear_t) and int(self.last_dbw_gear) == 1)
+        )
+
+    def _publish_arrived_hold(self, now: float) -> None:
+        self.pub_thr.publish(self._build_throttle(0.0))
+        self.pub_brk.publish(self._build_brake(float(_clamp(self.arrived_hold_brake_percent, 0.0, 1.0))))
+        # During ARRIVED hold, keep steering continuously commanded to center.
+        # This avoids depending on fresh Autoware control during the final hold.
+        self.pub_str.publish(self._build_steering(now, 0.0))
+        self._publish_misc_if_needed(now)
+
+    def _on_set_parameters(self, params):
+        for param in params:
+            if param.name == "auto_park_enable":
+                self.auto_park_enable = bool(param.value)
+                self.get_logger().info(
+                    f'Auto-park runtime toggle updated: {"ON" if self.auto_park_enable else "OFF"}.'
+                )
+            elif param.name == "arrived_hold_brake_enable":
+                self.arrived_hold_brake_enable = bool(param.value)
+                self.get_logger().info(
+                    f'ARRIVED hold-brake updated: {"ON" if self.arrived_hold_brake_enable else "OFF"}.'
+                )
+            elif param.name == "arrived_hold_brake_percent":
+                self.arrived_hold_brake_percent = float(param.value)
+                self.get_logger().info(
+                    f'ARRIVED hold-brake percent updated: {self.arrived_hold_brake_percent:.3f}.'
+                )
+            elif param.name == "auto_disable_after_park":
+                self.auto_disable_after_park = bool(param.value)
+                self.get_logger().info(
+                    f'Post-PARK auto-disable updated: {"ON" if self.auto_disable_after_park else "OFF"}.'
+                )
+            elif param.name == "post_park_disable_ms":
+                self.post_park_disable_ms = int(param.value)
+                self.get_logger().info(
+                    f'Post-PARK disable delay updated: {self.post_park_disable_ms} ms.'
+                )
+        return SetParametersResult(successful=True)
+
     # -------- callbacks --------
     def _on_engage(self, msg: AwEngage) -> None:
         new_engaged = bool(msg.engage)
@@ -526,6 +583,8 @@ class AutowareToDbwCan(Node):
         if self.last_route_state != int(RouteState.ARRIVED):
             self._auto_park_latched = False
             self._auto_park_seen_zero_t = 0.0
+            self._post_park_disable_pending = False
+            self._post_park_disable_at = 0.0
 
     def _on_gear_cmd(self, msg: AwGearCommand) -> None:
         desired_dbw = int(self._map_aw_gear_to_dbw(int(msg.command)))
@@ -669,7 +728,7 @@ class AutowareToDbwCan(Node):
         m.enable = True
         m.clear = False
         m.ignore = False
-        m.count = self._bump()
+        m.count = 0
         return m
 
     def _build_brake(self, percent: float) -> BrakeCmd:
@@ -680,7 +739,7 @@ class AutowareToDbwCan(Node):
         m.enable = True
         m.clear = False
         m.ignore = False
-        m.count = self._bump()
+        m.count = 0
         return m
 
     def _build_steering(self, now: float, tire_angle_rad: float) -> SteeringCmd:
@@ -697,7 +756,7 @@ class AutowareToDbwCan(Node):
         m.cmd_type = _const(SteeringCmd, "CMD_ANGLE", 0)
         m.steering_wheel_angle_cmd = float(wheel_target)
         m.steering_wheel_angle_velocity = float(vel)
-        m.count = self._bump()
+        m.count = 0
         return m
 
     def _publish_gear_cmd(self, desired_dbw: int) -> None:
@@ -731,8 +790,9 @@ class AutowareToDbwCan(Node):
         self.pub_thr.publish(self._build_throttle(0.0))
         self.pub_brk.publish(self._build_brake(brk))
 
-        tire = self.ctrl.tire_angle_rad if self._control_fresh(now) else 0.0
-        self.pub_str.publish(self._build_steering(now, tire))
+        # During a shift, keep steering continuously commanded to center so the
+        # DBW steering channel stays alive without depending on fresh Autoware control.
+        self.pub_str.publish(self._build_steering(now, 0.0))
 
         self._publish_misc_if_needed(now)
 
@@ -766,8 +826,16 @@ class AutowareToDbwCan(Node):
 
         if self.shift_state == self._SHIFT_POST_HOLD:
             if (now - self.shift_t_phase) * 1000.0 >= float(self.gear_post_shift_hold_ms):
+                completed_gear = int(self.shift_target_dbw_gear)
                 self.get_logger().info("Shift complete (post-hold done).")
                 self._shift_abort()
+                if (
+                    completed_gear == 1
+                    and self.auto_disable_after_park
+                    and self.last_route_state == int(RouteState.ARRIVED)
+                ):
+                    self._post_park_disable_pending = True
+                    self._post_park_disable_at = now + (float(self.post_park_disable_ms) / 1000.0)
 
     # -------- main loop --------
     def _on_timer(self) -> None:
@@ -778,6 +846,19 @@ class AutowareToDbwCan(Node):
             u = UInt8()
             u.data = int(self.last_hazard)
             self.pub_hazard_shim.publish(u)
+
+        if self._post_park_disable_pending:
+            if now >= self._post_park_disable_at:
+                self.pub_disable.publish(Empty())
+                self._post_park_disable_pending = False
+                self._post_park_disable_at = 0.0
+                self.get_logger().info("Post-PARK delay elapsed -> published /vehicle/disable.")
+            else:
+                self.pub_thr.publish(self._build_throttle(0.0))
+                self.pub_brk.publish(self._build_brake(float(_clamp(self.arrived_hold_brake_percent, 0.0, 1.0))))
+                self.pub_str.publish(self._build_steering(now, 0.0))
+                self._publish_misc_if_needed(now)
+                return
 
         # Auto-park: ARRIVED + zero speed dwell -> shift to PARK (DBW gear=1)
         if self.auto_park_enable:
@@ -805,11 +886,17 @@ class AutowareToDbwCan(Node):
                     self.shift_state = self._SHIFT_PRE_BRAKE
                     self.shift_cmd_sent = False
                     self._auto_park_latched = True
+                    self._post_park_disable_pending = False
+                    self._post_park_disable_at = 0.0
                     self.get_logger().info("Auto-park: ARRIVED + zero speed dwell satisfied -> shifting to PARK.")
 
         # Run shift FSM if active
         if self.shift_state != self._SHIFT_IDLE:
             self._run_shift(now)
+            return
+
+        if self._arrived_hold_active():
+            self._publish_arrived_hold(now)
             return
 
         # watchdog on control_cmd
